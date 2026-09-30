@@ -1,3 +1,7 @@
 name = "chat-me-backend"
 main = "src/index.js"
 compatibility_date = "2026-09-20"
+
+[[kv_namespaces]]
+binding = "CHATME_KV"
+id = "45af2c3469d4468b802a44dd513e43ad"
