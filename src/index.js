@@ -242,6 +242,25 @@ async function keyOwnerAllowed(env, claims, key, value, method, oldValue = null)
   // moderation fields they actually need. No browser-controlled role flag is
   // trusted here.
   if (d.lower.startsWith('user:')) {
+    // Bootstrap path for a brand-new Firebase account. Before the first KV
+    // profile exists, only the verified Firebase identity is trusted.
+    // Creation is limited to exactly user:<that Firebase email>.
+    const existingUser = rawUserFromValue(oldValue);
+    if (!existingUser && !isOwner(claims, env) && !isAdmin(claims, env) && !isModerator(claims, env)) {
+      const targetEmail = d.userEmail;
+      const claimEmail = String(claims.email || '').toLowerCase();
+      const claimUid = String(claims.user_id || claims.sub || '');
+      if (targetEmail &&
+          targetEmail === claimEmail &&
+          v &&
+          String(v.uid || '') === claimUid &&
+          String(v.email || '').toLowerCase() === claimEmail &&
+          String(v.username || '').trim().length >= 3 &&
+          String(v.username || '').trim().length <= 30) {
+        return true;
+      }
+      return false;
+    }
     if (isOwner(claims, env)) return true;
     if (isAdmin(claims, env)) {
       const old = rawUserFromValue(oldValue);
@@ -269,19 +288,7 @@ async function keyOwnerAllowed(env, claims, key, value, method, oldValue = null)
       }
       return true;
     }
-    // A newly registered Firebase user has no KV profile yet. Allow the
-    // authenticated user to create exactly their own first user record.
-    // This does NOT allow creating or overwriting another user's record.
-    if (!oldValue) {
-      return d.userEmail === email &&
-        v &&
-        String(v.uid || '') === id.uid &&
-        String(v.email || '').toLowerCase() === email;
-    }
-    return d.userEmail === email &&
-      v &&
-      String(v.uid || '') === id.uid &&
-      String(v.email || '').toLowerCase() === email;
+    return d.userEmail === email && v && String(v.uid || '') === id.uid && String(v.email || '').toLowerCase() === email;
   }
   if (d.lower.startsWith('audit:')) return isModerator(claims, env);
   if (d.lower.startsWith('purchase:')) {
