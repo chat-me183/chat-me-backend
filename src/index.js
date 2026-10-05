@@ -269,7 +269,19 @@ async function keyOwnerAllowed(env, claims, key, value, method, oldValue = null)
       }
       return true;
     }
-    return d.userEmail === email && v && String(v.uid || '') === id.uid && String(v.email || '').toLowerCase() === email;
+    // A newly registered Firebase user has no KV profile yet. Allow the
+    // authenticated user to create exactly their own first user record.
+    // This does NOT allow creating or overwriting another user's record.
+    if (!oldValue) {
+      return d.userEmail === email &&
+        v &&
+        String(v.uid || '') === id.uid &&
+        String(v.email || '').toLowerCase() === email;
+    }
+    return d.userEmail === email &&
+      v &&
+      String(v.uid || '') === id.uid &&
+      String(v.email || '').toLowerCase() === email;
   }
   if (d.lower.startsWith('audit:')) return isModerator(claims, env);
   if (d.lower.startsWith('purchase:')) {
