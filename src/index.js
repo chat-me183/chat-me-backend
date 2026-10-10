@@ -555,6 +555,13 @@ async function verifyCaptcha(request, env) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    // Fail loudly and specifically if the Cloudflare dashboard bindings this
+    // Worker depends on are missing after a redeploy - without this check,
+    // every account action just fails with a generic "could not be saved"
+    // error that gives no clue the real problem is a missing KV binding.
+    if (!env.CHATME_KV) {
+      return cors(request, json({ ok:false, error:'config_error', detail:'Cloudflare KV namespace binding "CHATME_KV" is missing. Go to Worker Settings > Variables and add a KV Namespace Binding named exactly CHATME_KV.' }, 500));
+    }
     if (request.method === 'OPTIONS') {
       const origin = request.headers.get('Origin') || '';
       const allowed = (() => { try { const o = new URL(origin); return o.origin === 'https://chat-me183.github.io' || (o.protocol === 'http:' && (o.hostname === 'localhost' || o.hostname === '127.0.0.1')); } catch { return false; } })();
