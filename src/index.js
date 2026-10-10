@@ -5,27 +5,6 @@ const JWKS_URL = 'https://www.googleapis.com/service_accounts/v1/jwk/securetoken
 let jwksCache = null;
 let jwksFetchedAt = 0;
 
-// Network resilience for external services: bounded timeout and retry for safe GET requests.
-async function fetchWithRetry(url, options = {}, config = {}) {
-  const attempts = config.attempts ?? 3;
-  const timeoutMs = config.timeoutMs ?? 8000;
-  let lastError;
-  for (let attempt = 0; attempt < attempts; attempt++) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort('network_timeout'), timeoutMs);
-    try {
-      const response = await fetch(url, { ...options, signal: controller.signal });
-      if (response.ok || response.status < 500 || attempt === attempts - 1) return response;
-      lastError = new Error(`upstream_http_${response.status}`);
-    } catch (error) {
-      lastError = error;
-      if (attempt === attempts - 1) break;
-    } finally { clearTimeout(timer); }
-    await new Promise(resolve => setTimeout(resolve, 250 * (attempt + 1)));
-  }
-  throw new Error(lastError?.name === 'AbortError' ? 'upstream_timeout' : 'upstream_unavailable');
-}
-
 function json(data, status = 200, extra = {}) {
   return new Response(JSON.stringify(data), {
     status,
@@ -64,7 +43,7 @@ function parseJwt(token) {
 
 async function getJwks() {
   if (jwksCache && Date.now() - jwksFetchedAt < 6 * 60 * 60 * 1000) return jwksCache;
-  const r = await fetchWithRetry(JWKS_URL, { cf: { cacheTtl: 21600, cacheEverything: true } }, { attempts: 3, timeoutMs: 7000 });
+  const r = await fetch(JWKS_URL, { cf: { cacheTtl: 21600, cacheEverything: true } });
   if (!r.ok) throw new Error('jwks_unavailable');
   jwksCache = await r.json();
   jwksFetchedAt = Date.now();
@@ -241,8 +220,8 @@ function validatePostMutation(oldValue,newValue,claims,method,isOwnerFlag=false,
     if(typeof next.id!=='string' || next.id.length<3 || next.id.length>120) return false;
     if(typeof next.authorName!=='string' || next.authorName.length>200) return false;
     if(typeof next.text!=='string' || next.text.length>20000) return false;
-    if(next.image && (typeof next.image!=='string' || next.image.length>17500000)) return false;
-    if(next.video && (typeof next.video!=='string' || next.video.length>17500000)) return false;
+    if(next.image && (typeof next.image!=='string' || next.image.length>7_000_000)) return false;
+    if(next.video && (typeof next.video!=='string' || next.video.length>7_000_000)) return false;
     if(!Number.isFinite(Number(next.time))) return false;
     if(Number(next.time) < Date.now()-10*60*1000 || Number(next.time) > Date.now()+10*60*1000) return false;
     if(!Array.isArray(next.likes) || next.likes.length!==0) return false;
@@ -483,7 +462,7 @@ async function handleStorage(request, env, claims) {
   if (op === 'set') {
     const body = await request.json().catch(() => null);
     const value = body?.value;
-    if (typeof value !== 'string' || value.length > 20_000_000) return json({ ok:false, error:'invalid_value' }, 400);
+    if (typeof value !== 'string' || value.length > 8_000_000) return json({ ok:false, error:'invalid_value' }, 400);
     if (!await keyOwnerAllowed(env, claims, key, value, 'write', await env.CHATME_KV.get(key))) return json({ ok:false, error:'forbidden' }, 403);
     await env.CHATME_KV.put(key, value);
     return json({ ok:true });
@@ -568,7 +547,7 @@ async function verifyCaptcha(request, env) {
   const token = body?.token;
   if (!token || !env.RECAPTCHA_SECRET) return json({ success:false }, 400);
   const form = new URLSearchParams({ secret: env.RECAPTCHA_SECRET, response: token });
-  const r = await fetchWithRetry('https://www.google.com/recaptcha/api/siteverify', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:form }, { attempts: 2, timeoutMs: 8000 });
+  const r = await fetch('https://www.google.com/recaptcha/api/siteverify', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:form });
   const data = await r.json().catch(() => ({}));
   return json({ success: data.success === true });
 }
@@ -604,8 +583,6 @@ export default {
       let error = 'internal_error';
       if (msg === 'auth_required' || msg === 'bad_token' || msg === 'bad_alg' || msg === 'bad_signature' || msg === 'bad_claims' || msg === 'unknown_kid') {
         status = 401; error = 'auth_required';
-      } else if (msg === 'upstream_timeout' || msg === 'upstream_unavailable' || msg === 'jwks_unavailable') {
-        status = 503; error = 'temporarily_unavailable';
       } else if (msg === 'account_banned') {
         status = 403; error = 'account_banned';
       } else if (msg === 'forbidden' || msg === 'owner_only') {
