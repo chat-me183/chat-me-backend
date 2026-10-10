@@ -5,6 +5,27 @@ const JWKS_URL = 'https://www.googleapis.com/service_accounts/v1/jwk/securetoken
 let jwksCache = null;
 let jwksFetchedAt = 0;
 
+// Network resilience for external services: bounded timeout and retry for safe GET requests.
+async function fetchWithRetry(url, options = {}, config = {}) {
+  const attempts = config.attempts ?? 3;
+  const timeoutMs = config.timeoutMs ?? 8000;
+  let lastError;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort('network_timeout'), timeoutMs);
+    try {
+      const response = await fetch(url, { ...options, signal: controller.signal });
+      if (response.ok || response.status < 500 || attempt === attempts - 1) return response;
+      lastError = new Error(`upstream_http_${response.status}`);
+    } catch (error) {
+      lastError = error;
+      if (attempt === attempts - 1) break;
+    } finally { clearTimeout(timer); }
+    await new Promise(resolve => setTimeout(resolve, 250 * (attempt + 1)));
+  }
+  throw new Error(lastError?.name === 'AbortError' ? 'upstream_timeout' : 'upstream_unavailable');
+}
+
 function json(data, status = 200, extra = {}) {
   return new Response(JSON.stringify(data), {
     status,
@@ -43,7 +64,7 @@ function parseJwt(token) {
 
 async function getJwks() {
   if (jwksCache && Date.now() - jwksFetchedAt < 6 * 60 * 60 * 1000) return jwksCache;
-  const r = await fetch(JWKS_URL, { cf: { cacheTtl: 21600, cacheEverything: true } });
+  const r = await fetchWithRetry(JWKS_URL, { cf: { cacheTtl: 21600, cacheEverything: true } }, { attempts: 3, timeoutMs: 7000 });
   if (!r.ok) throw new Error('jwks_unavailable');
   jwksCache = await r.json();
   jwksFetchedAt = Date.now();
@@ -107,19 +128,8 @@ async function resolveRole(env, claims) {
 
 function decodeKey(key) {
   const k = String(key || '');
-  const lower = k.toLowerCase();
   const m = k.match(/^chat:(.+)__(.+)$/i);
-  // Username-scoped keys have different prefix lengths. Do not use a fixed
-  // slice(6): for friends:/notifs:/requests: that leaves part of the prefix
-  // in the username and makes valid registration writes get forbidden.
-  const usernamePrefixes = [
-    'uname:', 'friends:', 'requests:', 'sentreq:', 'notifs:', 'presence:',
-    'seen:', 'lasttab:', 'dailybonus:', 'bdaycheck:', 'announcedates:',
-    'gamewins:', 'lastpurchase:', 'privacy:', 'savedposts:', 'storyviews:'
-  ];
-  const usernamePrefix = usernamePrefixes.find(prefix => lower.startsWith(prefix));
-  const username = usernamePrefix ? lower.slice(usernamePrefix.length) : lower.slice(6);
-  return { key: k, lower, userEmail: lower.slice(5), username, chatUsers: m ? [m[1].toLowerCase(), m[2].toLowerCase()] : null };
+  return { key: k, lower: k.toLowerCase(), userEmail: k.slice(5).toLowerCase(), username: k.slice(6).toLowerCase(), chatUsers: m ? [m[1].toLowerCase(), m[2].toLowerCase()] : null };
 }
 
 function rawUserFromValue(value) {
@@ -558,7 +568,7 @@ async function verifyCaptcha(request, env) {
   const token = body?.token;
   if (!token || !env.RECAPTCHA_SECRET) return json({ success:false }, 400);
   const form = new URLSearchParams({ secret: env.RECAPTCHA_SECRET, response: token });
-  const r = await fetch('https://www.google.com/recaptcha/api/siteverify', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:form });
+  const r = await fetchWithRetry('https://www.google.com/recaptcha/api/siteverify', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:form }, { attempts: 2, timeoutMs: 8000 });
   const data = await r.json().catch(() => ({}));
   return json({ success: data.success === true });
 }
@@ -594,6 +604,8 @@ export default {
       let error = 'internal_error';
       if (msg === 'auth_required' || msg === 'bad_token' || msg === 'bad_alg' || msg === 'bad_signature' || msg === 'bad_claims' || msg === 'unknown_kid') {
         status = 401; error = 'auth_required';
+      } else if (msg === 'upstream_timeout' || msg === 'upstream_unavailable' || msg === 'jwks_unavailable') {
+        status = 503; error = 'temporarily_unavailable';
       } else if (msg === 'account_banned') {
         status = 403; error = 'account_banned';
       } else if (msg === 'forbidden' || msg === 'owner_only') {
