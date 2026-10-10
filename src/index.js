@@ -116,40 +116,11 @@ function rawUserFromValue(value) {
 }
 
 async function identity(env, claims) {
-  const email = String(claims.email || '').trim().toLowerCase();
-  const uid = String(claims.user_id || claims.sub || '');
-  if (!email) return { email:'', uid, username:'' };
-
-  // The profile record is the primary identity source. Some older Chat Me
-  // accounts can have a valid uname:<username> index even when the profile's
-  // username field is missing/blank. Recover only by matching that index's
-  // stored email to the verified Firebase token email; never trust a browser
-  // supplied username or an unverified token claim.
+  const email = String(claims.email || '').toLowerCase();
+  if (!email) return { email:'', uid:String(claims.user_id || claims.sub || ''), username:'' };
   const raw = await env.CHATME_KV.get('user:' + email);
   let u = null; try { u = raw ? JSON.parse(raw) : null; } catch {}
-  let username = String(u?.username || '').trim().toLowerCase();
-  if (!username && env.CHATME_KV && typeof env.CHATME_KV.list === 'function') {
-    let cursor;
-    // Walk the username index only when the primary profile is incomplete.
-    for (let page = 0; page < 20; page++) {
-      const options = { prefix: 'uname:', limit: 1000 };
-      if (cursor) options.cursor = cursor;
-      const result = await env.CHATME_KV.list(options);
-      for (const item of (result.keys || [])) {
-        const indexedEmail = await env.CHATME_KV.get(item.name);
-        if (String(indexedEmail || '').trim().toLowerCase() === email) {
-          username = String(item.name).slice('uname:'.length).trim().toLowerCase();
-          break;
-        }
-      }
-      if (username || !result.list_complete || !result.cursor) {
-        if (username || result.list_complete || !result.cursor) break;
-      }
-      cursor = result.cursor;
-      if (!cursor) break;
-    }
-  }
-  return { email, uid, username };
+  return { email, uid:String(claims.user_id || claims.sub || ''), username:String(u?.username || '').toLowerCase() };
 }
 
 function sameArrayExceptOwnChange(oldValue, newValue, username, mode) {
@@ -251,8 +222,16 @@ function validatePostMutation(oldValue,newValue,claims,method,isOwnerFlag=false,
     if(typeof next.text!=='string' || next.text.length>20000) return false;
     if(next.image && (typeof next.image!=='string' || next.image.length>1800000)) return false;
     if(next.video && (typeof next.video!=='string' || next.video.length>1800000)) return false;
+    // Accept the full post schema emitted by the live frontend.
+    if(next.title != null && (typeof next.title !== 'string' || next.title.length > 300)) return false;
+    if(next.tags != null && (typeof next.tags !== 'string' || next.tags.length > 500)) return false;
+    if(next.visibility != null && !['public','friends','private'].includes(String(next.visibility))) return false;
+    if(next.color != null && (typeof next.color !== 'string' || next.color.length > 100)) return false;
+    if(next.poll != null && (!next.poll || typeof next.poll !== 'object' || Array.isArray(next.poll))) return false;
     if(!Number.isFinite(Number(next.time))) return false;
     if(Number(next.time) < Date.now()-10*60*1000 || Number(next.time) > Date.now()+10*60*1000) return false;
+    const allowedNewPostFields = new Set(['id','author','authorName','title','text','tags','visibility','type','color','image','video','time','likes','comments','shareCount','poll']);
+    if(Object.keys(next).some(k => !allowedNewPostFields.has(k))) return false;
     if(!Array.isArray(next.likes) || next.likes.length!==0) return false;
     if(!Array.isArray(next.comments) || next.comments.length!==0) return false;
     if(Number(next.shareCount||0)!==0) return false;
