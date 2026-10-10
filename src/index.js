@@ -241,8 +241,8 @@ function validatePostMutation(oldValue,newValue,claims,method,isOwnerFlag=false,
     if(typeof next.id!=='string' || next.id.length<3 || next.id.length>120) return false;
     if(typeof next.authorName!=='string' || next.authorName.length>200) return false;
     if(typeof next.text!=='string' || next.text.length>20000) return false;
-    if(next.image && (typeof next.image!=='string' || next.image.length>1800000)) return false;
-    if(next.video && (typeof next.video!=='string' || next.video.length>1800000)) return false;
+    if(next.image && (typeof next.image!=='string' || next.image.length>17500000)) return false;
+    if(next.video && (typeof next.video!=='string' || next.video.length>17500000)) return false;
     if(!Number.isFinite(Number(next.time))) return false;
     if(Number(next.time) < Date.now()-10*60*1000 || Number(next.time) > Date.now()+10*60*1000) return false;
     if(!Array.isArray(next.likes) || next.likes.length!==0) return false;
@@ -483,7 +483,7 @@ async function handleStorage(request, env, claims) {
   if (op === 'set') {
     const body = await request.json().catch(() => null);
     const value = body?.value;
-    if (typeof value !== 'string' || value.length > 2_000_000) return json({ ok:false, error:'invalid_value' }, 400);
+    if (typeof value !== 'string' || value.length > 20_000_000) return json({ ok:false, error:'invalid_value' }, 400);
     if (!await keyOwnerAllowed(env, claims, key, value, 'write', await env.CHATME_KV.get(key))) return json({ ok:false, error:'forbidden' }, 403);
     await env.CHATME_KV.put(key, value);
     return json({ ok:true });
