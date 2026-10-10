@@ -456,20 +456,20 @@ async function handleStorage(request, env, claims) {
   if (op === 'get') {
     const value = await env.CHATME_KV.get(key);
     if (value == null) return json({ ok:true, value:null });
-    if (!await keyOwnerAllowed(env, claims, key, value, 'read')) return json({ ok:false, error:'forbidden' }, 403);
+    if (!await keyOwnerAllowed(env, claims, key, value, 'read')) { console.warn('CHATME_STORAGE_DENIED', JSON.stringify({op:'get', keyPrefix:key.split(':')[0], role:claims._chatmeRole || 'user', uidPresent:!!claims.sub})); return json({ ok:false, error:'forbidden' }, 403); }
     return json({ ok:true, value:publicSanitize(key, value, claims, env) });
   }
   if (op === 'set') {
     const body = await request.json().catch(() => null);
     const value = body?.value;
     if (typeof value !== 'string' || value.length > 2_000_000) return json({ ok:false, error:'invalid_value' }, 400);
-    if (!await keyOwnerAllowed(env, claims, key, value, 'write', await env.CHATME_KV.get(key))) return json({ ok:false, error:'forbidden' }, 403);
+    if (!await keyOwnerAllowed(env, claims, key, value, 'write', await env.CHATME_KV.get(key))) { console.warn('CHATME_STORAGE_DENIED', JSON.stringify({op:'set', keyPrefix:key.split(':')[0], role:claims._chatmeRole || 'user', uidPresent:!!claims.sub, emailPresent:!!claims.email})); return json({ ok:false, error:'forbidden' }, 403); }
     await env.CHATME_KV.put(key, value);
     return json({ ok:true });
   }
   if (op === 'delete') {
     const old = await env.CHATME_KV.get(key);
-    if (old != null && !await keyOwnerAllowed(env, claims, key, old, 'delete', old)) return json({ ok:false, error:'forbidden' }, 403);
+    if (old != null && !await keyOwnerAllowed(env, claims, key, old, 'delete', old)) { console.warn('CHATME_STORAGE_DENIED', JSON.stringify({op:'delete', keyPrefix:key.split(':')[0], role:claims._chatmeRole || 'user', uidPresent:!!claims.sub})); return json({ ok:false, error:'forbidden' }, 403); }
     await env.CHATME_KV.delete(key);
     return json({ ok:true });
   }
@@ -555,13 +555,6 @@ async function verifyCaptcha(request, env) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    // Fail loudly and specifically if the Cloudflare dashboard bindings this
-    // Worker depends on are missing after a redeploy - without this check,
-    // every account action just fails with a generic "could not be saved"
-    // error that gives no clue the real problem is a missing KV binding.
-    if (!env.CHATME_KV) {
-      return cors(request, json({ ok:false, error:'config_error', detail:'Cloudflare KV namespace binding "CHATME_KV" is missing. Go to Worker Settings > Variables and add a KV Namespace Binding named exactly CHATME_KV.' }, 500));
-    }
     if (request.method === 'OPTIONS') {
       const origin = request.headers.get('Origin') || '';
       const allowed = (() => { try { const o = new URL(origin); return o.origin === 'https://chat-me183.github.io' || (o.protocol === 'http:' && (o.hostname === 'localhost' || o.hostname === '127.0.0.1')); } catch { return false; } })();
