@@ -222,16 +222,8 @@ function validatePostMutation(oldValue,newValue,claims,method,isOwnerFlag=false,
     if(typeof next.text!=='string' || next.text.length>20000) return false;
     if(next.image && (typeof next.image!=='string' || next.image.length>1800000)) return false;
     if(next.video && (typeof next.video!=='string' || next.video.length>1800000)) return false;
-    // Accept the full post schema emitted by the live frontend.
-    if(next.title != null && (typeof next.title !== 'string' || next.title.length > 300)) return false;
-    if(next.tags != null && (typeof next.tags !== 'string' || next.tags.length > 500)) return false;
-    if(next.visibility != null && !['public','friends','private'].includes(String(next.visibility))) return false;
-    if(next.color != null && (typeof next.color !== 'string' || next.color.length > 100)) return false;
-    if(next.poll != null && (!next.poll || typeof next.poll !== 'object' || Array.isArray(next.poll))) return false;
     if(!Number.isFinite(Number(next.time))) return false;
     if(Number(next.time) < Date.now()-10*60*1000 || Number(next.time) > Date.now()+10*60*1000) return false;
-    const allowedNewPostFields = new Set(['id','author','authorName','title','text','tags','visibility','type','color','image','video','time','likes','comments','shareCount','poll']);
-    if(Object.keys(next).some(k => !allowedNewPostFields.has(k))) return false;
     if(!Array.isArray(next.likes) || next.likes.length!==0) return false;
     if(!Array.isArray(next.comments) || next.comments.length!==0) return false;
     if(Number(next.shareCount||0)!==0) return false;
@@ -471,8 +463,36 @@ async function handleStorage(request, env, claims) {
     const body = await request.json().catch(() => null);
     const value = body?.value;
     if (typeof value !== 'string' || value.length > 2_000_000) return json({ ok:false, error:'invalid_value' }, 400);
-    if (!await keyOwnerAllowed(env, claims, key, value, 'write', await env.CHATME_KV.get(key))) return json({ ok:false, error:'forbidden' }, 403);
-    await env.CHATME_KV.put(key, value);
+    const oldValue = await env.CHATME_KV.get(key);
+    const allowed = await keyOwnerAllowed(env, claims, key, value, 'write', oldValue);
+    const namespace = String(key.split(':', 1)[0] || 'unknown').slice(0, 30);
+    if (!allowed) {
+      // Diagnostic booleans only: never log tokens, email addresses, usernames, or stored values.
+      const identityInfo = await identity(env, claims);
+      const keyLower = key.toLowerCase();
+      const diagnostics = {
+        operation: 'set', namespace,
+        hadExistingValue: oldValue !== null,
+        isStaff: isStaff(claims, env),
+        identityUidPresent: !!identityInfo.uid,
+        identityEmailPresent: !!identityInfo.email,
+        identityUsernamePresent: !!identityInfo.username,
+        userUidMatchesToken: keyLower.startsWith('user:') ? String(v?.uid || '') === String(claims.user_id || claims.sub || '') : null,
+        userEmailMatchesToken: keyLower.startsWith('user:') ? String(v?.email || '').toLowerCase() === String(claims.email || '').toLowerCase() : null,
+        userKeyMatchesTokenEmail: keyLower.startsWith('user:') ? key.slice(5).toLowerCase() === String(claims.email || '').toLowerCase() : null,
+        usernameKeyMatchesIdentity: keyLower.startsWith('uname:') ? key.slice(6).toLowerCase() === identityInfo.username : null,
+        usernameValueMatchesIdentityEmail: keyLower.startsWith('uname:') ? String(value || '').toLowerCase() === identityInfo.email : null
+      };
+      console.log('CHATME_STORAGE_WRITE_DENIED', JSON.stringify(diagnostics));
+      return json({ ok:false, error:'forbidden' }, 403);
+    }
+    try {
+      await env.CHATME_KV.put(key, value);
+      console.log('CHATME_STORAGE_WRITE_OK', JSON.stringify({ operation:'set', namespace }));
+    } catch (writeError) {
+      console.error('CHATME_KV_PUT_FAILED', JSON.stringify({ operation:'set', namespace, errorName:String(writeError?.name || 'Error') }));
+      throw writeError;
+    }
     return json({ ok:true });
   }
   if (op === 'delete') {
