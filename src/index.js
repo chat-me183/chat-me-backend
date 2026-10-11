@@ -2,6 +2,20 @@ const PROJECT_ID = 'chat-me-383d6';
 const ISSUER = `https://securetoken.google.com/${PROJECT_ID}`;
 const JWKS_URL = 'https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com';
 
+// Bound external network waits so a stalled upstream does not hang a request forever.
+async function fetchWithTimeout(resource, options = {}, timeoutMs = 5000) {
+  const controller = new AbortController();
+  const externalSignal = options.signal;
+  const abortFromExternal = () => controller.abort(externalSignal?.reason);
+  if (externalSignal) {
+    if (externalSignal.aborted) abortFromExternal();
+    else externalSignal.addEventListener('abort', abortFromExternal, { once: true });
+  }
+  const timer = setTimeout(() => controller.abort('network_timeout'), timeoutMs);
+  try { return await fetch(resource, { ...options, signal: controller.signal }); }
+  finally { clearTimeout(timer); externalSignal?.removeEventListener('abort', abortFromExternal); }
+}
+
 let jwksCache = null;
 let jwksFetchedAt = 0;
 
@@ -42,12 +56,28 @@ function parseJwt(token) {
 }
 
 async function getJwks() {
+  // Reuse cached Firebase signing keys to avoid a network round-trip on most requests.
   if (jwksCache && Date.now() - jwksFetchedAt < 6 * 60 * 60 * 1000) return jwksCache;
-  const r = await fetch(JWKS_URL, { cf: { cacheTtl: 21600, cacheEverything: true } });
-  if (!r.ok) throw new Error('jwks_unavailable');
-  jwksCache = await r.json();
-  jwksFetchedAt = Date.now();
-  return jwksCache;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort('jwks_timeout'), 2000);
+  try {
+    const r = await fetchWithTimeout(JWKS_URL, {
+      signal: controller.signal,
+      cf: { cacheTtl: 21600, cacheEverything: true }
+    });
+    if (!r.ok) throw new Error('jwks_unavailable');
+    const keys = await r.json();
+    if (!Array.isArray(keys?.keys) || keys.keys.length === 0) throw new Error('jwks_unavailable');
+    jwksCache = keys;
+    jwksFetchedAt = Date.now();
+    return jwksCache;
+  } catch (error) {
+    // Keep already fetched keys usable during a temporary Google/network outage.
+    if (jwksCache && Array.isArray(jwksCache.keys) && jwksCache.keys.length) return jwksCache;
+    throw new Error('network_unavailable');
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function verifyFirebaseToken(token) {
@@ -259,39 +289,12 @@ function validatePostMutation(oldValue,newValue,claims,method,isOwnerFlag=false,
   for(const k of keys) if(!['id','author','authorName','text','type','color','image','time','edited','sharedFrom','likes','reactions','comments','shareCount','poll'].includes(k)&&!sameValue(old[k],next[k])) return false;
   return true;
 }
-function validateReceiptMutation(oldMessage,newMessage,actor) {
-  if (!oldMessage || !newMessage || lowerName(oldMessage.from) === actor) return false;
-  const receiptFields = ['deliveredTo','readBy'];
-  const permitted = new Set([...receiptFields,'deliveredAt','readAt']);
-  const keys = new Set([...Object.keys(oldMessage), ...Object.keys(newMessage)]);
-  for (const key of keys) {
-    if (permitted.has(key)) continue;
-    if (!sameValue(oldMessage[key], newMessage[key])) return false;
-  }
-  let changed = false;
-  for (const field of receiptFields) {
-    const before = Array.isArray(oldMessage[field]) ? oldMessage[field] : [];
-    const after = Array.isArray(newMessage[field]) ? newMessage[field] : [];
-    if (sameValue(before, after)) continue;
-    if (after.some(x => lowerName(x) !== actor && !before.some(y => lowerName(y) === lowerName(x)))) return false;
-    if (before.some(x => !after.some(y => lowerName(y) === lowerName(x)))) return false;
-    if (after.filter(x => lowerName(x) === actor).length > 1) return false;
-    changed = true;
-  }
-  for (const field of ['deliveredAt','readAt']) {
-    if (!sameValue(oldMessage[field],newMessage[field])) {
-      if (newMessage[field] == null || !Number.isFinite(Date.parse(String(newMessage[field])))) return false;
-      changed = true;
-    }
-  }
-  return changed;
-}
 function validateMessageMutation(oldValue,newValue,actor,isAdmin=false) {
   let old=[],next=[]; try{old=JSON.parse(oldValue||'[]');next=JSON.parse(newValue||'[]')}catch{return false;}
   if(!Array.isArray(old)||!Array.isArray(next)||!actor) return false;
   if(isAdmin && old.some(m=>lowerName(m?.from)===actor)) return true;
   if(next.length===old.length+1){for(let i=0;i<old.length;i++)if(!sameValue(old[i],next[i]))return false;const m=next[next.length-1];return lowerName(m?.from)===actor&&typeof m?.text==='string'&&m.text.length<=5000;}
-  if(next.length===old.length){let changed=0;for(let i=0;i<old.length;i++){if(sameValue(old[i],next[i]))continue;changed++;const a=old[i],b=next[i];if(lowerName(a?.from)!==actor){if(!validateReceiptMutation(a,b,actor))return false;continue;}const ar=a?.reactions&&typeof a.reactions==='object'?a.reactions:{};const br=b?.reactions&&typeof b.reactions==='object'?b.reactions:{};const ca={...a};const cb={...b};delete ca.reactions;delete cb.reactions;if(!sameValue(ca,cb)&&!(typeof b.text==='string'&&b.text.length<=5000&&b.edited===true))return false;if(!actorOnlyReactionChange(ar,br,actor))return false;}return changed===1;}
+  if(next.length===old.length){let changed=0;for(let i=0;i<old.length;i++){if(sameValue(old[i],next[i]))continue;changed++;const a=old[i],b=next[i];if(lowerName(a?.from)!==actor)return false;const ar=a?.reactions&&typeof a.reactions==='object'?a.reactions:{};const br=b?.reactions&&typeof b.reactions==='object'?b.reactions:{};const ca={...a};const cb={...b};delete ca.reactions;delete cb.reactions;if(!sameValue(ca,cb)&&!(typeof b.text==='string'&&b.text.length<=5000&&b.edited===true))return false;if(!actorOnlyReactionChange(ar,br,actor))return false;}return changed===1;}
   if(next.length===old.length-1){let j=0,missing=-1;for(let i=0;i<old.length;i++){if(j<next.length&&sameValue(old[i],next[j]))j++;else{if(missing!==-1)return false;missing=i;}}if(missing<0)return false;const m=old[missing];return lowerName(m?.from)===actor||isAdmin;}
   return false;
 }
@@ -715,7 +718,7 @@ async function migrateLegacy(request, env, claims) {
   let pages = 0;
   do {
     const u = new URL(base); u.searchParams.set('pageSize','300'); if (pageToken) u.searchParams.set('pageToken', pageToken);
-    const r = await fetch(u, { headers: { Authorization: `Bearer ${token}` } });
+    const r = await fetchWithTimeout(u, { headers: { Authorization: `Bearer ${token}` } }, 8000);
     if (!r.ok) return json({ ok:false, error:'firestore_migration_read_failed', status:r.status }, 502);
     const data = await r.json();
     for (const doc of data.documents || []) {
@@ -735,13 +738,14 @@ async function verifyCaptcha(request, env) {
   const token = body?.token;
   if (!token || !env.RECAPTCHA_SECRET) return json({ success:false }, 400);
   const form = new URLSearchParams({ secret: env.RECAPTCHA_SECRET, response: token });
-  const r = await fetch('https://www.google.com/recaptcha/api/siteverify', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:form });
+  const r = await fetchWithTimeout('https://www.google.com/recaptcha/api/siteverify', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:form }, 5000);
   const data = await r.json().catch(() => ({}));
   return json({ success: data.success === true });
 }
 
 export default {
   async fetch(request, env) {
+    const startedAt = Date.now();
     const url = new URL(request.url);
     if (request.method === 'OPTIONS') {
       const origin = request.headers.get('Origin') || '';
@@ -773,6 +777,8 @@ export default {
         status = 401; error = 'auth_required';
       } else if (msg === 'account_banned') {
         status = 403; error = 'account_banned';
+      } else if (msg === 'network_unavailable' || msg === 'jwks_unavailable') {
+        status = 503; error = 'network_unavailable';
       } else if (msg === 'forbidden' || msg === 'owner_only') {
         status = 403; error = 'forbidden';
       }
