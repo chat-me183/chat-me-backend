@@ -14,7 +14,7 @@ function json(data, status = 200, extra = {}) {
 
 function cors(request, response) {
   const origin = request.headers.get('Origin') || '';
-  const allowed = (() => { try { const o = new URL(origin); return o.origin === 'https://chat-me183.github.io' || (o.protocol === 'https:' && o.hostname.endsWith('.pages.dev')) || (o.protocol === 'http:' && (o.hostname === 'localhost' || o.hostname === '127.0.0.1')); } catch { return false; } })();
+  const allowed = (() => { try { const o = new URL(origin); return o.origin === 'https://chat-me183.github.io' || (o.protocol === 'http:' && (o.hostname === 'localhost' || o.hostname === '127.0.0.1')); } catch { return false; } })();
   if (!allowed) return response;
   const h = new Headers(response.headers);
   h.set('Access-Control-Allow-Origin', origin);
@@ -385,7 +385,7 @@ async function keyOwnerAllowed(env, claims, key, value, method, oldValue = null)
     if (!old||!Array.isArray(next)||next.length!==old.length+1) return false;
     for(let i=0;i<old.length;i++) if(!sameValue(old[i],next[i])) return false;
     const n=next[next.length-1];
-    const allowedTypes=['message','reaction','comment','like','announcement','welcome','coins_topup','purchase_rejected','friend_request','friend_accept','mention','virtual_gift','purchase_request'];
+    const allowedTypes=['message','reaction','comment','like','announcement','welcome','coins_topup','purchase_rejected','friend_request','mention','virtual_gift','purchase_request'];
     return lowerName(n?.from)===username && allowedTypes.includes(String(n?.type||''));
   }
   if (d.lower.startsWith('presence:') || d.lower.startsWith('seen:') || d.lower.startsWith('lasttab:') || d.lower.startsWith('dailybonus:') || d.lower.startsWith('bdaycheck:') || d.lower.startsWith('announcedates:') || d.lower.startsWith('gamewins:') || d.lower.startsWith('lastpurchase:') || d.lower.startsWith('privacy:') || d.lower.startsWith('savedposts:') || d.lower.startsWith('storyviews:')) return d.username === username;
@@ -540,20 +540,6 @@ async function cmExternalizeMedia(storageKey, value, env) {
   return JSON.stringify(obj);
 }
 
-async function writeAudit(env, claims, action, key, extra = {}) {
-  // Audit metadata only; never store tokens, passwords, full profile records, or message content.
-  try {
-    const uid = String(claims?.sub || 'unknown').slice(0, 128);
-    const role = String(claims?._chatmeRole || 'user').slice(0, 24);
-    const safeKey = String(key || '').slice(0, 180);
-    const record = { action:String(action).slice(0, 60), target:safeKey, actorUid:uid, actorRole:role, time:Date.now(), ...extra };
-    await env.CHATME_KV.put('audit:' + Date.now() + ':' + crypto.randomUUID(), JSON.stringify(record), { expirationTtl: 60 * 60 * 24 * 365 });
-  } catch (e) {
-    // Auditing must not turn a successful primary action into a failed request.
-    console.error('CHATME_AUDIT_WRITE_FAILED');
-  }
-}
-
 async function handleStorage(request, env, claims) {
   const url = new URL(request.url);
   const op = url.searchParams.get('op') || 'get';
@@ -604,9 +590,6 @@ async function handleStorage(request, env, claims) {
       const storedValue = (key.startsWith('post:') || key.startsWith('gpost:')) ? await cmExternalizeMedia(key, value, env) : value;
       if (storedValue.length > 2_000_000) return json({ ok:false, error:'value_too_large_after_media_chunking' }, 400);
       await env.CHATME_KV.put(key, storedValue);
-      if (isStaff(claims, env) && (key.startsWith('user:') || key.startsWith('post:') || key.startsWith('report:') || key.startsWith('supportticket:') || key === 'ads:active' || key.startsWith('role:'))) {
-        await writeAudit(env, claims, 'storage_set', key, { namespace });
-      }
       console.log('CHATME_STORAGE_WRITE_OK', JSON.stringify({ operation:'set', namespace }));
     } catch (writeError) {
       console.error('CHATME_KV_PUT_FAILED', JSON.stringify({ operation:'set', namespace, errorName:String(writeError?.name || 'Error') }));
@@ -629,9 +612,6 @@ async function handleStorage(request, env, claims) {
       await Promise.all(cleanup);
     }
     await env.CHATME_KV.delete(key);
-    if (isStaff(claims, env) && (key.startsWith('user:') || key.startsWith('post:') || key.startsWith('report:') || key.startsWith('supportticket:') || key === 'ads:active' || key.startsWith('role:'))) {
-      await writeAudit(env, claims, 'storage_delete', key, { namespace:String(key.split(':',1)[0] || 'unknown') });
-    }
     return json({ ok:true });
   }
   if (op === 'list') {
@@ -659,6 +639,124 @@ async function handleStorage(request, env, claims) {
     return json({ ok:true, keys: keys.map(x => x.name), cursor: result.list_complete ? null : result.cursor });
   }
   return json({ ok:false, error:'unknown_op' }, 400);
+}
+
+async function cmReadArray(env, key) {
+  const raw = await env.CHATME_KV.get(key);
+  if (!raw) return [];
+  try { const v = JSON.parse(raw); return Array.isArray(v) ? v : []; } catch { return []; }
+}
+function cmHasName(arr, name, field) {
+  const target = lowerName(name);
+  return arr.some(x => lowerName(field ? x?.[field] : x) === target);
+}
+function cmProfileBlocks(profile, username) {
+  if (!profile) return false;
+  const lists = [profile.blockedUsers, profile.blockedUsernames, profile.blocked, profile.blockList];
+  return lists.some(list => Array.isArray(list) && list.some(x => lowerName(typeof x === 'string' ? x : x?.username) === lowerName(username)));
+}
+async function cmGetProfileByUsername(env, username) {
+  const email = await env.CHATME_KV.get('uname:' + lowerName(username));
+  if (!email) return null;
+  const raw = await env.CHATME_KV.get('user:' + String(email).toLowerCase());
+  const profile = raw ? rawUserFromValue(raw) : null;
+  if (!profile || lowerName(profile.username) !== lowerName(username)) return null;
+  return profile;
+}
+async function createFriendRequest(request, env, claims) {
+  const actor = await identity(env, claims);
+  const from = lowerName(actor.username);
+  const body = await request.json().catch(() => null);
+  const to = lowerName(body?.username || body?.to || '');
+  if (!from) return json({ ok:false, error:'profile_username_missing' }, 400);
+  if (!/^[a-z0-9_.-]{2,64}$/.test(to)) return json({ ok:false, error:'invalid_username' }, 400);
+  if (from === to) return json({ ok:false, error:'cannot_add_self' }, 400);
+  const [senderProfile, targetProfile] = await Promise.all([
+    env.CHATME_KV.get('user:' + actor.email).then(raw => raw ? rawUserFromValue(raw) : null),
+    cmGetProfileByUsername(env, to)
+  ]);
+  if (!targetProfile) return json({ ok:false, error:'user_not_found' }, 404);
+  if (cmProfileBlocks(senderProfile, to) || cmProfileBlocks(targetProfile, from)) return json({ ok:false, error:'user_blocked' }, 403);
+  const fromFriendsKey = 'friends:' + from, toFriendsKey = 'friends:' + to;
+  const fromReqKey = 'requests:' + from, toReqKey = 'requests:' + to;
+  const fromSentKey = 'sentreq:' + from, toNotifKey = 'notifs:' + to;
+  const [fromFriends, toFriends, myIncoming, theirIncoming, mySent, theirNotifs] = await Promise.all([
+    cmReadArray(env, fromFriendsKey), cmReadArray(env, toFriendsKey),
+    cmReadArray(env, fromReqKey), cmReadArray(env, toReqKey),
+    cmReadArray(env, fromSentKey), cmReadArray(env, toNotifKey)
+  ]);
+  if (cmHasName(fromFriends, to) || cmHasName(toFriends, from)) return json({ ok:true, status:'friends' });
+  if (cmHasName(myIncoming, to, 'from')) return json({ ok:false, error:'incoming_request_exists' }, 409);
+  const alreadyPending = cmHasName(theirIncoming, from, 'from') || cmHasName(mySent, to);
+  if (!cmHasName(theirIncoming, from, 'from')) theirIncoming.push({ from, time:Date.now() });
+  if (!cmHasName(mySent, to)) mySent.push(to);
+  if (!theirNotifs.some(n => n?.type === 'friend_request' && lowerName(n?.from) === from && !n?.handled)) {
+    theirNotifs.push({ id:Date.now() + '-' + Math.random().toString(36).slice(2,8), type:'friend_request', from, fromName:((senderProfile?.firstName || '') + ' ' + (senderProfile?.lastName || '')).trim() || from, time:Date.now(), read:false, handled:false });
+  }
+  await Promise.all([
+    env.CHATME_KV.put(toReqKey, JSON.stringify(theirIncoming)),
+    env.CHATME_KV.put(fromSentKey, JSON.stringify(mySent)),
+    env.CHATME_KV.put(toNotifKey, JSON.stringify(theirNotifs))
+  ]);
+  return json({ ok:true, status:alreadyPending ? 'already_pending' : 'sent' });
+}
+async function acceptFriendRequest(request, env, claims) {
+  const actor = await identity(env, claims);
+  const me = lowerName(actor.username);
+  const body = await request.json().catch(() => null);
+  const from = lowerName(body?.username || body?.from || '');
+  if (!me) return json({ ok:false, error:'profile_username_missing' }, 400);
+  if (!/^[a-z0-9_.-]{2,64}$/.test(from) || from === me) return json({ ok:false, error:'invalid_username' }, 400);
+  const senderProfile = await cmGetProfileByUsername(env, from);
+  if (!senderProfile) return json({ ok:false, error:'user_not_found' }, 404);
+  const reqKey = 'requests:' + me, sentKey = 'sentreq:' + from;
+  const myNotifKey = 'notifs:' + me, theirNotifKey = 'notifs:' + from;
+  const [myRequests, myFriends, theirFriends, theirSent, myNotifs, theirNotifs] = await Promise.all([
+    cmReadArray(env, reqKey), cmReadArray(env, 'friends:' + me), cmReadArray(env, 'friends:' + from),
+    cmReadArray(env, sentKey), cmReadArray(env, myNotifKey), cmReadArray(env, theirNotifKey)
+  ]);
+  const hasPending = cmHasName(myRequests, from, 'from') || myNotifs.some(n => n?.type === 'friend_request' && lowerName(n?.from) === from && !n?.handled);
+  if (!hasPending && !(cmHasName(myFriends, from) && cmHasName(theirFriends, me))) return json({ ok:false, error:'request_not_found' }, 404);
+  if (!cmHasName(myFriends, from)) myFriends.push(from);
+  if (!cmHasName(theirFriends, me)) theirFriends.push(me);
+  const nextRequests = myRequests.filter(r => lowerName(r?.from) !== from);
+  const nextSent = theirSent.filter(u => lowerName(u) !== me);
+  const nextMyNotifs = myNotifs.map(n => n?.type === 'friend_request' && lowerName(n?.from) === from ? { ...n, handled:true, read:true, acceptedAt:Date.now() } : n);
+  if (!theirNotifs.some(n => n?.type === 'friend_accept' && lowerName(n?.from) === me && Number(n?.time) > Date.now() - 60000)) {
+    const receiverRaw = await env.CHATME_KV.get('user:' + actor.email);
+    const receiverProfile = receiverRaw ? rawUserFromValue(receiverRaw) : null;
+    theirNotifs.push({ id:Date.now() + '-' + Math.random().toString(36).slice(2,8), type:'friend_accept', from:me, fromName:((receiverProfile?.firstName || '') + ' ' + (receiverProfile?.lastName || '')).trim() || me, time:Date.now(), read:false, handled:true });
+  }
+  await Promise.all([
+    env.CHATME_KV.put('friends:' + me, JSON.stringify(myFriends)),
+    env.CHATME_KV.put('friends:' + from, JSON.stringify(theirFriends)),
+    env.CHATME_KV.put(reqKey, JSON.stringify(nextRequests)),
+    env.CHATME_KV.put(sentKey, JSON.stringify(nextSent)),
+    env.CHATME_KV.put(myNotifKey, JSON.stringify(nextMyNotifs)),
+    env.CHATME_KV.put(theirNotifKey, JSON.stringify(theirNotifs))
+  ]);
+  return json({ ok:true, status:'friends' });
+}
+
+async function declineFriendRequest(request, env, claims) {
+  const actor = await identity(env, claims);
+  const me = lowerName(actor.username);
+  const body = await request.json().catch(() => null);
+  const from = lowerName(body?.username || body?.from || '');
+  if (!me) return json({ ok:false, error:'profile_username_missing' }, 400);
+  if (!/^[a-z0-9_.-]{2,64}$/.test(from) || from === me) return json({ ok:false, error:'invalid_username' }, 400);
+  const [myRequests, myNotifs, theirSent] = await Promise.all([
+    cmReadArray(env, 'requests:' + me), cmReadArray(env, 'notifs:' + me), cmReadArray(env, 'sentreq:' + from)
+  ]);
+  const nextRequests = myRequests.filter(r => lowerName(r?.from) !== from);
+  const nextNotifs = myNotifs.map(n => n?.type === 'friend_request' && lowerName(n?.from) === from ? { ...n, handled:true, read:true, declinedAt:Date.now() } : n);
+  const nextSent = theirSent.filter(u => lowerName(u) !== me);
+  await Promise.all([
+    env.CHATME_KV.put('requests:' + me, JSON.stringify(nextRequests)),
+    env.CHATME_KV.put('notifs:' + me, JSON.stringify(nextNotifs)),
+    env.CHATME_KV.put('sentreq:' + from, JSON.stringify(nextSent))
+  ]);
+  return json({ ok:true, status:'declined' });
 }
 
 async function adminOverview(env, claims) {
@@ -713,7 +811,6 @@ async function staffRole(request, env, claims) {
   if (current === 'admin' && role === 'admin') return json({ ok:false, error:'owner_only' }, 403);
   if (role === 'user') await env.CHATME_KV.delete('role:' + uid);
   else await env.CHATME_KV.put('role:' + uid, role);
-  await writeAudit(env, claims, 'staff_role_changed', 'role:' + uid, { assignedRole:role });
   return json({ ok:true, uid, role });
 }
 
@@ -763,7 +860,7 @@ export default {
     const url = new URL(request.url);
     if (request.method === 'OPTIONS') {
       const origin = request.headers.get('Origin') || '';
-      const allowed = (() => { try { const o = new URL(origin); return o.origin === 'https://chat-me183.github.io' || (o.protocol === 'https:' && o.hostname.endsWith('.pages.dev')) || (o.protocol === 'http:' && (o.hostname === 'localhost' || o.hostname === '127.0.0.1')); } catch { return false; } })();
+      const allowed = (() => { try { const o = new URL(origin); return o.origin === 'https://chat-me183.github.io' || (o.protocol === 'http:' && (o.hostname === 'localhost' || o.hostname === '127.0.0.1')); } catch { return false; } })();
       if (!allowed) return new Response('', { status: 403 });
       return new Response(null, { status: 204, headers: {
         'Access-Control-Allow-Origin': origin,
@@ -778,6 +875,9 @@ export default {
       if (url.pathname === '/health') return cors(request, json({ ok:true, service:'chat-me-secure' }));
       const claims = await auth(request, env);
       await assertNotBanned(env, claims);
+      if (url.pathname === '/friends/request' && request.method === 'POST') return cors(request, await createFriendRequest(request, env, claims));
+      if (url.pathname === '/friends/accept' && request.method === 'POST') return cors(request, await acceptFriendRequest(request, env, claims));
+      if (url.pathname === '/friends/decline' && request.method === 'POST') return cors(request, await declineFriendRequest(request, env, claims));
       if (url.pathname === '/role' && request.method === 'GET') return cors(request, await getRole(request, env, claims));
       if (url.pathname === '/admin/overview' && request.method === 'GET') return cors(request, await adminOverview(env, claims));
       if (url.pathname === '/staff-role' && request.method === 'POST') return cors(request, await staffRole(request, env, claims));
