@@ -259,12 +259,39 @@ function validatePostMutation(oldValue,newValue,claims,method,isOwnerFlag=false,
   for(const k of keys) if(!['id','author','authorName','text','type','color','image','time','edited','sharedFrom','likes','reactions','comments','shareCount','poll'].includes(k)&&!sameValue(old[k],next[k])) return false;
   return true;
 }
+function validateReceiptMutation(oldMessage,newMessage,actor) {
+  if (!oldMessage || !newMessage || lowerName(oldMessage.from) === actor) return false;
+  const receiptFields = ['deliveredTo','readBy'];
+  const permitted = new Set([...receiptFields,'deliveredAt','readAt']);
+  const keys = new Set([...Object.keys(oldMessage), ...Object.keys(newMessage)]);
+  for (const key of keys) {
+    if (permitted.has(key)) continue;
+    if (!sameValue(oldMessage[key], newMessage[key])) return false;
+  }
+  let changed = false;
+  for (const field of receiptFields) {
+    const before = Array.isArray(oldMessage[field]) ? oldMessage[field] : [];
+    const after = Array.isArray(newMessage[field]) ? newMessage[field] : [];
+    if (sameValue(before, after)) continue;
+    if (after.some(x => lowerName(x) !== actor && !before.some(y => lowerName(y) === lowerName(x)))) return false;
+    if (before.some(x => !after.some(y => lowerName(y) === lowerName(x)))) return false;
+    if (after.filter(x => lowerName(x) === actor).length > 1) return false;
+    changed = true;
+  }
+  for (const field of ['deliveredAt','readAt']) {
+    if (!sameValue(oldMessage[field],newMessage[field])) {
+      if (newMessage[field] == null || !Number.isFinite(Date.parse(String(newMessage[field])))) return false;
+      changed = true;
+    }
+  }
+  return changed;
+}
 function validateMessageMutation(oldValue,newValue,actor,isAdmin=false) {
   let old=[],next=[]; try{old=JSON.parse(oldValue||'[]');next=JSON.parse(newValue||'[]')}catch{return false;}
   if(!Array.isArray(old)||!Array.isArray(next)||!actor) return false;
   if(isAdmin && old.some(m=>lowerName(m?.from)===actor)) return true;
   if(next.length===old.length+1){for(let i=0;i<old.length;i++)if(!sameValue(old[i],next[i]))return false;const m=next[next.length-1];return lowerName(m?.from)===actor&&typeof m?.text==='string'&&m.text.length<=5000;}
-  if(next.length===old.length){let changed=0;for(let i=0;i<old.length;i++){if(sameValue(old[i],next[i]))continue;changed++;const a=old[i],b=next[i];if(lowerName(a?.from)!==actor)return false;const ar=a?.reactions&&typeof a.reactions==='object'?a.reactions:{};const br=b?.reactions&&typeof b.reactions==='object'?b.reactions:{};const ca={...a};const cb={...b};delete ca.reactions;delete cb.reactions;if(!sameValue(ca,cb)&&!(typeof b.text==='string'&&b.text.length<=5000&&b.edited===true))return false;if(!actorOnlyReactionChange(ar,br,actor))return false;}return changed===1;}
+  if(next.length===old.length){let changed=0;for(let i=0;i<old.length;i++){if(sameValue(old[i],next[i]))continue;changed++;const a=old[i],b=next[i];if(lowerName(a?.from)!==actor){if(!validateReceiptMutation(a,b,actor))return false;continue;}const ar=a?.reactions&&typeof a.reactions==='object'?a.reactions:{};const br=b?.reactions&&typeof b.reactions==='object'?b.reactions:{};const ca={...a};const cb={...b};delete ca.reactions;delete cb.reactions;if(!sameValue(ca,cb)&&!(typeof b.text==='string'&&b.text.length<=5000&&b.edited===true))return false;if(!actorOnlyReactionChange(ar,br,actor))return false;}return changed===1;}
   if(next.length===old.length-1){let j=0,missing=-1;for(let i=0;i<old.length;i++){if(j<next.length&&sameValue(old[i],next[j]))j++;else{if(missing!==-1)return false;missing=i;}}if(missing<0)return false;const m=old[missing];return lowerName(m?.from)===actor||isAdmin;}
   return false;
 }
@@ -278,8 +305,6 @@ async function keyOwnerAllowed(env, claims, key, value, method, oldValue = null)
   const v = rawUserFromValue(value);
 
   if (method === 'read') {
-    // Ad configuration must be readable by members so sponsored cards can render.
-    if (d.lower === 'ads:active') return true;
     if (d.lower.startsWith('user:')) return true; // response is sanitized for non-staff below
     if (d.lower.startsWith('uname:')) return true;
     if (d.lower.startsWith('friends:')) return true; // friend lists are social/public
@@ -299,8 +324,26 @@ async function keyOwnerAllowed(env, claims, key, value, method, oldValue = null)
       return !!circle && (!circle.isPrivate || (Array.isArray(circle.members) && circle.members.some(m=>lowerName(m)===username)) || (Array.isArray(circle.pendingInvites) && circle.pendingInvites.some(i=>lowerName(i?.username)===username)) || isStaff(claims,env));
     }
     if (d.chatUsers) return !!username && d.chatUsers.includes(username);
-    if (d.lower.startsWith('typing:')) return !!username && d.lower.endsWith(':' + username);
-    if (d.lower.startsWith('requests:') || d.lower.startsWith('sentreq:') || d.lower.startsWith('notifs:') || d.lower.startsWith('presence:') || d.lower.startsWith('seen:') || d.lower.startsWith('lasttab:') || d.lower.startsWith('dailybonus:') || d.lower.startsWith('bdaycheck:') || d.lower.startsWith('announcedates:') || d.lower.startsWith('gamewins:') || d.lower.startsWith('lastpurchase:') || d.lower.startsWith('privacy:') || d.lower.startsWith('savedposts:') || d.lower.startsWith('storyviews:')) return d.lower.includes(':' + username);
+    if (d.lower.startsWith('typing:')) {
+      if (!username) return false;
+      const lastColon = key.lastIndexOf(':');
+      if (lastColon < 7) return false;
+      const target = key.slice(7, lastColon);
+      const writer = key.slice(lastColon + 1).toLowerCase();
+      if (target.toLowerCase().startsWith('chat:')) {
+        const chat = decodeKey(target);
+        return !!chat.chatUsers && chat.chatUsers.includes(username) && chat.chatUsers.includes(writer);
+      }
+      const ci = circleKindAndId(target);
+      if (ci) {
+        const circle = rawUserFromValue(await env.CHATME_KV.get(ci.kind + ':' + ci.id));
+        const members = Array.isArray(circle?.members) ? circle.members.map(lowerName) : [];
+        return members.includes(username) && members.includes(writer);
+      }
+      return writer === username;
+    }
+    if (d.lower.startsWith('presence:')) return true; // Only a heartbeat timestamp is exposed; this enables online/offline indicators.
+    if (d.lower.startsWith('requests:') || d.lower.startsWith('sentreq:') || d.lower.startsWith('notifs:') || d.lower.startsWith('seen:') || d.lower.startsWith('lasttab:') || d.lower.startsWith('dailybonus:') || d.lower.startsWith('bdaycheck:') || d.lower.startsWith('announcedates:') || d.lower.startsWith('gamewins:') || d.lower.startsWith('lastpurchase:') || d.lower.startsWith('privacy:') || d.lower.startsWith('savedposts:') || d.lower.startsWith('storyviews:')) return d.lower.includes(':' + username);
     if (d.lower.startsWith('report:')) { const r=rawUserFromValue(value); return isStaff(claims,env) || lowerName(r?.reporterUsername)===username; }
     if (d.lower.startsWith('supportticket:') || d.lower.startsWith('audit:') || d.lower.startsWith('purchase:')) return isStaff(claims, env) || d.lower.includes(username);
     return isStaff(claims, env);
@@ -310,7 +353,6 @@ async function keyOwnerAllowed(env, claims, key, value, method, oldValue = null)
   // administrative account changes, while moderators are restricted to the
   // moderation fields they actually need. No browser-controlled role flag is
   // trusted here.
-  if (d.lower === 'ads:active') return isAdmin(claims, env); // only owner/admin may publish, disable, or delete ads
   if (d.lower.startsWith('user:')) {
     if (isOwner(claims, env)) return true;
     if (isAdmin(claims, env)) {
@@ -385,8 +427,10 @@ async function keyOwnerAllowed(env, claims, key, value, method, oldValue = null)
     if (!old||!Array.isArray(next)||next.length!==old.length+1) return false;
     for(let i=0;i<old.length;i++) if(!sameValue(old[i],next[i])) return false;
     const n=next[next.length-1];
-    const allowedTypes=['message','reaction','comment','like','announcement','welcome','coins_topup','purchase_rejected','friend_request','mention','virtual_gift','purchase_request'];
-    return lowerName(n?.from)===username && allowedTypes.includes(String(n?.type||''));
+    const allowedTypes=['message','reaction','comment','like','announcement','welcome','coins_topup','purchase_rejected','friend_request','friend_accept','mention','virtual_gift','purchase_request','friend_post','story_view','group_join','group_add','group_leave','room_join','room_add','room_leave'];
+    const notificationType=String(n?.type||'');
+    // System announcements sent to another user are staff-only; user-generated social events must be authored by the authenticated sender.
+    return lowerName(n?.from)===username && (allowedTypes.includes(notificationType) || (notificationType==='system' && isStaff(claims,env)));
   }
   if (d.lower.startsWith('presence:') || d.lower.startsWith('seen:') || d.lower.startsWith('lasttab:') || d.lower.startsWith('dailybonus:') || d.lower.startsWith('bdaycheck:') || d.lower.startsWith('announcedates:') || d.lower.startsWith('gamewins:') || d.lower.startsWith('lastpurchase:') || d.lower.startsWith('privacy:') || d.lower.startsWith('savedposts:') || d.lower.startsWith('storyviews:')) return d.username === username;
   if (d.chatUsers) {
@@ -489,7 +533,7 @@ function publicSanitize(key, value, claims, env) {
   if (ownEmail && keyEmail === ownEmail) return value;
   const u = rawUserFromValue(value);
   if (!u) return value;
-  const safe = { username:u.username, firstName:u.firstName||'', lastName:u.lastName||'', nickname:u.nickname||'', country:u.country||'', createdAt:u.createdAt||null, status:u.status||'', statusUpdatedAt:u.statusUpdatedAt||null, bio:u.bio||'', verified:!!u.verified, profileLocked:!!u.profileLocked, isOwner:false, isAdmin:false, isModerator:false, isSupportAgent:false };
+  const safe = { username:u.username, firstName:u.firstName||'', lastName:u.lastName||'', nickname:u.nickname||'', country:u.country||'', createdAt:u.createdAt||null, status:u.status||'', statusUpdatedAt:u.statusUpdatedAt||null, bio:u.bio||'', profilePic:u.profilePic||null, coverPhoto:u.coverPhoto||null, verified:!!u.verified, profileLocked:!!u.profileLocked, isOwner:false, isAdmin:false, isModerator:false, isSupportAgent:false };
   return JSON.stringify(safe);
 }
 
@@ -641,171 +685,6 @@ async function handleStorage(request, env, claims) {
   return json({ ok:false, error:'unknown_op' }, 400);
 }
 
-async function cmReadArray(env, key) {
-  const raw = await env.CHATME_KV.get(key);
-  if (!raw) return [];
-  try { const v = JSON.parse(raw); return Array.isArray(v) ? v : []; } catch { return []; }
-}
-function cmHasName(arr, name, field) {
-  const target = lowerName(name);
-  return arr.some(x => lowerName(field ? x?.[field] : x) === target);
-}
-function cmProfileBlocks(profile, username) {
-  if (!profile) return false;
-  const lists = [profile.blockedUsers, profile.blockedUsernames, profile.blocked, profile.blockList];
-  return lists.some(list => Array.isArray(list) && list.some(x => lowerName(typeof x === 'string' ? x : x?.username) === lowerName(username)));
-}
-async function cmGetProfileByUsername(env, username) {
-  const email = await env.CHATME_KV.get('uname:' + lowerName(username));
-  if (!email) return null;
-  const raw = await env.CHATME_KV.get('user:' + String(email).toLowerCase());
-  const profile = raw ? rawUserFromValue(raw) : null;
-  if (!profile || lowerName(profile.username) !== lowerName(username)) return null;
-  return profile;
-}
-async function createFriendRequest(request, env, claims) {
-  const actor = await identity(env, claims);
-  const from = lowerName(actor.username);
-  const body = await request.json().catch(() => null);
-  const to = lowerName(body?.username || body?.to || '');
-  if (!from) return json({ ok:false, error:'profile_username_missing' }, 400);
-  if (!/^[a-z0-9_.-]{2,64}$/.test(to)) return json({ ok:false, error:'invalid_username' }, 400);
-  if (from === to) return json({ ok:false, error:'cannot_add_self' }, 400);
-  const [senderProfile, targetProfile] = await Promise.all([
-    env.CHATME_KV.get('user:' + actor.email).then(raw => raw ? rawUserFromValue(raw) : null),
-    cmGetProfileByUsername(env, to)
-  ]);
-  if (!targetProfile) return json({ ok:false, error:'user_not_found' }, 404);
-  if (cmProfileBlocks(senderProfile, to) || cmProfileBlocks(targetProfile, from)) return json({ ok:false, error:'user_blocked' }, 403);
-  const fromFriendsKey = 'friends:' + from, toFriendsKey = 'friends:' + to;
-  const fromReqKey = 'requests:' + from, toReqKey = 'requests:' + to;
-  const fromSentKey = 'sentreq:' + from, toNotifKey = 'notifs:' + to;
-  const [fromFriends, toFriends, myIncoming, theirIncoming, mySent, theirNotifs] = await Promise.all([
-    cmReadArray(env, fromFriendsKey), cmReadArray(env, toFriendsKey),
-    cmReadArray(env, fromReqKey), cmReadArray(env, toReqKey),
-    cmReadArray(env, fromSentKey), cmReadArray(env, toNotifKey)
-  ]);
-  if (cmHasName(fromFriends, to) || cmHasName(toFriends, from)) return json({ ok:true, status:'friends' });
-  if (cmHasName(myIncoming, to, 'from')) return json({ ok:false, error:'incoming_request_exists' }, 409);
-  const alreadyPending = cmHasName(theirIncoming, from, 'from') || cmHasName(mySent, to);
-  if (!cmHasName(theirIncoming, from, 'from')) theirIncoming.push({ from, time:Date.now() });
-  if (!cmHasName(mySent, to)) mySent.push(to);
-  if (!theirNotifs.some(n => n?.type === 'friend_request' && lowerName(n?.from) === from && !n?.handled)) {
-    theirNotifs.push({ id:Date.now() + '-' + Math.random().toString(36).slice(2,8), type:'friend_request', from, fromName:((senderProfile?.firstName || '') + ' ' + (senderProfile?.lastName || '')).trim() || from, time:Date.now(), read:false, handled:false });
-  }
-  await Promise.all([
-    env.CHATME_KV.put(toReqKey, JSON.stringify(theirIncoming)),
-    env.CHATME_KV.put(fromSentKey, JSON.stringify(mySent)),
-    env.CHATME_KV.put(toNotifKey, JSON.stringify(theirNotifs))
-  ]);
-  return json({ ok:true, status:alreadyPending ? 'already_pending' : 'sent' });
-}
-async function acceptFriendRequest(request, env, claims) {
-  const actor = await identity(env, claims);
-  const me = lowerName(actor.username);
-  const body = await request.json().catch(() => null);
-  const from = lowerName(body?.username || body?.from || '');
-  if (!me) return json({ ok:false, error:'profile_username_missing' }, 400);
-  if (!/^[a-z0-9_.-]{2,64}$/.test(from) || from === me) return json({ ok:false, error:'invalid_username' }, 400);
-  const senderProfile = await cmGetProfileByUsername(env, from);
-  if (!senderProfile) return json({ ok:false, error:'user_not_found' }, 404);
-  const reqKey = 'requests:' + me, sentKey = 'sentreq:' + from;
-  const myNotifKey = 'notifs:' + me, theirNotifKey = 'notifs:' + from;
-  const [myRequests, myFriends, theirFriends, theirSent, myNotifs, theirNotifs] = await Promise.all([
-    cmReadArray(env, reqKey), cmReadArray(env, 'friends:' + me), cmReadArray(env, 'friends:' + from),
-    cmReadArray(env, sentKey), cmReadArray(env, myNotifKey), cmReadArray(env, theirNotifKey)
-  ]);
-  // Treat either side's pending-request index as evidence. Older client versions
-  // may have saved sentreq but failed to save requests/notifs; accepting should
-  // still reconcile both accounts instead of leaving a stuck request.
-  const hasPending = cmHasName(myRequests, from, 'from')
-    || myNotifs.some(n => n?.type === 'friend_request' && lowerName(n?.from) === from && !n?.handled)
-    || cmHasName(theirSent, me);
-  if (!hasPending && !(cmHasName(myFriends, from) && cmHasName(theirFriends, me))) return json({ ok:false, error:'request_not_found' }, 404);
-  if (!cmHasName(myFriends, from)) myFriends.push(from);
-  if (!cmHasName(theirFriends, me)) theirFriends.push(me);
-  const nextRequests = myRequests.filter(r => lowerName(r?.from) !== from);
-  const nextSent = theirSent.filter(u => lowerName(u) !== me);
-  const nextMyNotifs = myNotifs.map(n => n?.type === 'friend_request' && lowerName(n?.from) === from ? { ...n, handled:true, read:true, acceptedAt:Date.now() } : n);
-  const receiverRaw = await env.CHATME_KV.get('user:' + actor.email);
-  const receiverProfile = receiverRaw ? rawUserFromValue(receiverRaw) : null;
-  const recentAccept = theirNotifs.some(n => n?.type === 'friend_accept' && lowerName(n?.from) === me && Number(n?.time) > Date.now() - 60000);
-  if (!recentAccept) {
-    theirNotifs.push({ id:Date.now() + '-' + Math.random().toString(36).slice(2,8), type:'friend_accept', from:me, fromName:((receiverProfile?.firstName || '') + ' ' + (receiverProfile?.lastName || '')).trim() || me, time:Date.now(), read:false, handled:true });
-  }
-  await Promise.all([
-    env.CHATME_KV.put('friends:' + me, JSON.stringify(myFriends)),
-    env.CHATME_KV.put('friends:' + from, JSON.stringify(theirFriends)),
-    env.CHATME_KV.put(reqKey, JSON.stringify(nextRequests)),
-    env.CHATME_KV.put(sentKey, JSON.stringify(nextSent)),
-    env.CHATME_KV.put(myNotifKey, JSON.stringify(nextMyNotifs)),
-    env.CHATME_KV.put(theirNotifKey, JSON.stringify(theirNotifs))
-  ]);
-  return json({ ok:true, status:'friends' });
-}
-
-async function declineFriendRequest(request, env, claims) {
-  const actor = await identity(env, claims);
-  const me = lowerName(actor.username);
-  const body = await request.json().catch(() => null);
-  const from = lowerName(body?.username || body?.from || '');
-  if (!me) return json({ ok:false, error:'profile_username_missing' }, 400);
-  if (!/^[a-z0-9_.-]{2,64}$/.test(from) || from === me) return json({ ok:false, error:'invalid_username' }, 400);
-  const [myRequests, myNotifs, theirSent] = await Promise.all([
-    cmReadArray(env, 'requests:' + me), cmReadArray(env, 'notifs:' + me), cmReadArray(env, 'sentreq:' + from)
-  ]);
-  const nextRequests = myRequests.filter(r => lowerName(r?.from) !== from);
-  const nextNotifs = myNotifs.map(n => n?.type === 'friend_request' && lowerName(n?.from) === from ? { ...n, handled:true, read:true, declinedAt:Date.now() } : n);
-  const nextSent = theirSent.filter(u => lowerName(u) !== me);
-  await Promise.all([
-    env.CHATME_KV.put('requests:' + me, JSON.stringify(nextRequests)),
-    env.CHATME_KV.put('notifs:' + me, JSON.stringify(nextNotifs)),
-    env.CHATME_KV.put('sentreq:' + from, JSON.stringify(nextSent))
-  ]);
-  return json({ ok:true, status:'declined' });
-}
-
-async function adminOverview(env, claims) {
-  if (!isStaff(claims, env)) return json({ ok:false, error:'forbidden' }, 403);
-  const countPrefix = async (prefix, maxPages = 50) => {
-    let cursor;
-    let count = 0;
-    let pages = 0;
-    do {
-      const page = await env.CHATME_KV.list({ prefix, limit: 1000, ...(cursor ? { cursor } : {}) });
-      count += page.keys.length;
-      cursor = page.list_complete ? undefined : page.cursor;
-      pages++;
-    } while (cursor && pages < maxPages);
-    return { count, complete: !cursor };
-  };
-  const [users, posts, reports, tickets, adsRaw, userKeys] = await Promise.all([
-    countPrefix('user:'), countPrefix('post:'), countPrefix('report:'), countPrefix('supportticket:'),
-    env.CHATME_KV.get('ads:active'), env.CHATME_KV.list({ prefix:'user:', limit:1000 })
-  ]);
-  let pendingVerification = 0;
-  let verifiedUsers = 0;
-  // Verification counts are sampled from stored profile records; totals are explicitly marked
-  // incomplete when KV pagination exceeds the configured safety cap.
-  let cursor = undefined;
-  let pages = 0;
-  do {
-    const page = pages === 0 ? userKeys : await env.CHATME_KV.list({ prefix:'user:', limit:1000, cursor });
-    for (const item of page.keys) {
-      const raw = await env.CHATME_KV.get(item.name);
-      if (!raw) continue;
-      const profile = rawUserFromValue(raw);
-      if (profile?.pendingVerification === true) pendingVerification++;
-      if (profile?.verified === true) verifiedUsers++;
-    }
-    cursor = page.list_complete ? undefined : page.cursor;
-    pages++;
-  } while (cursor && pages < 50);
-  let ads = null;
-  try { ads = adsRaw ? JSON.parse(adsRaw) : null; } catch { ads = null; }
-  return json({ ok:true, counts:{ users:users.count, posts:posts.count, reports:reports.count, supportTickets:tickets.count, pendingVerification, verifiedUsers }, complete:{ users:users.complete, posts:posts.complete, reports:reports.complete, supportTickets:tickets.complete, verificationScan:!cursor }, ads });
-}
-
 async function staffRole(request, env, claims) {
   const current = claims._chatmeRole;
   if (current !== 'owner' && current !== 'admin') return json({ ok:false, error:'forbidden' }, 403);
@@ -881,11 +760,7 @@ export default {
       if (url.pathname === '/health') return cors(request, json({ ok:true, service:'chat-me-secure' }));
       const claims = await auth(request, env);
       await assertNotBanned(env, claims);
-      if (url.pathname === '/friends/request' && request.method === 'POST') return cors(request, await createFriendRequest(request, env, claims));
-      if (url.pathname === '/friends/accept' && request.method === 'POST') return cors(request, await acceptFriendRequest(request, env, claims));
-      if (url.pathname === '/friends/decline' && request.method === 'POST') return cors(request, await declineFriendRequest(request, env, claims));
       if (url.pathname === '/role' && request.method === 'GET') return cors(request, await getRole(request, env, claims));
-      if (url.pathname === '/admin/overview' && request.method === 'GET') return cors(request, await adminOverview(env, claims));
       if (url.pathname === '/staff-role' && request.method === 'POST') return cors(request, await staffRole(request, env, claims));
       if (url.pathname === '/storage') return cors(request, await handleStorage(request, env, claims));
       if (url.pathname === '/migrate-legacy') return cors(request, await migrateLegacy(request, env, claims));
