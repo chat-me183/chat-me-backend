@@ -385,7 +385,7 @@ async function keyOwnerAllowed(env, claims, key, value, method, oldValue = null)
     if (!old||!Array.isArray(next)||next.length!==old.length+1) return false;
     for(let i=0;i<old.length;i++) if(!sameValue(old[i],next[i])) return false;
     const n=next[next.length-1];
-    const allowedTypes=['message','reaction','comment','like','announcement','welcome','coins_topup','purchase_rejected','friend_request','mention','virtual_gift','purchase_request'];
+    const allowedTypes=['message','reaction','comment','like','announcement','welcome','coins_topup','purchase_rejected','friend_request','friend_accept','mention','virtual_gift','purchase_request'];
     return lowerName(n?.from)===username && allowedTypes.includes(String(n?.type||''));
   }
   if (d.lower.startsWith('presence:') || d.lower.startsWith('seen:') || d.lower.startsWith('lasttab:') || d.lower.startsWith('dailybonus:') || d.lower.startsWith('bdaycheck:') || d.lower.startsWith('announcedates:') || d.lower.startsWith('gamewins:') || d.lower.startsWith('lastpurchase:') || d.lower.startsWith('privacy:') || d.lower.startsWith('savedposts:') || d.lower.startsWith('storyviews:')) return d.username === username;
