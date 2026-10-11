@@ -14,7 +14,7 @@ function json(data, status = 200, extra = {}) {
 
 function cors(request, response) {
   const origin = request.headers.get('Origin') || '';
-  const allowed = (() => { try { const o = new URL(origin); return o.origin === 'https://chat-me183.github.io' || (o.protocol === 'http:' && (o.hostname === 'localhost' || o.hostname === '127.0.0.1')); } catch { return false; } })();
+  const allowed = (() => { try { const o = new URL(origin); return o.origin === 'https://chat-me183.github.io' || (o.protocol === 'https:' && o.hostname.endsWith('.pages.dev')) || (o.protocol === 'http:' && (o.hostname === 'localhost' || o.hostname === '127.0.0.1')); } catch { return false; } })();
   if (!allowed) return response;
   const h = new Headers(response.headers);
   h.set('Access-Control-Allow-Origin', origin);
@@ -107,8 +107,17 @@ async function resolveRole(env, claims) {
 
 function decodeKey(key) {
   const k = String(key || '');
+  const lower = k.toLowerCase();
+  const colon = k.indexOf(':');
+  const prefix = colon >= 0 ? lower.slice(0, colon) : lower;
+  const suffix = colon >= 0 ? k.slice(colon + 1) : '';
   const m = k.match(/^chat:(.+)__(.+)$/i);
-  return { key: k, lower: k.toLowerCase(), userEmail: k.slice(5).toLowerCase(), username: k.slice(6).toLowerCase(), chatUsers: m ? [m[1].toLowerCase(), m[2].toLowerCase()] : null };
+  // Most social keys are scoped as namespace:username. Parse the namespace
+  // first; slicing at a fixed offset breaks requests:, sentreq:, notifs:, etc.
+  const username = ['user','post','gpost','chat','group','room','circle'].includes(prefix)
+    ? suffix.toLowerCase()
+    : suffix.split(':', 1)[0].toLowerCase();
+  return { key: k, lower, userEmail: prefix === 'user' ? suffix.toLowerCase() : k.slice(5).toLowerCase(), username, chatUsers: m ? [m[1].toLowerCase(), m[2].toLowerCase()] : null };
 }
 
 function rawUserFromValue(value) {
@@ -133,6 +142,15 @@ function sameArrayExceptOwnChange(oldValue, newValue, username, mode) {
   if (sa.length !== sb.length || sa.some((x,i)=>x.toLowerCase() !== sb[i].toLowerCase())) return false;
   if (mode === 'add') return b.some(x => String(x).toLowerCase() === username) || a.some(x => String(x).toLowerCase() === username);
   return true;
+}
+
+function validateIncomingRequestAppend(oldValue, newValue, actor) {
+  let oldRequests=[], nextRequests=[];
+  try { oldRequests=JSON.parse(oldValue || '[]'); nextRequests=JSON.parse(newValue || '[]'); } catch { return false; }
+  if (!Array.isArray(oldRequests) || !Array.isArray(nextRequests) || !actor || nextRequests.length !== oldRequests.length + 1) return false;
+  for (let i=0;i<oldRequests.length;i++) if (!sameValue(oldRequests[i], nextRequests[i])) return false;
+  const request=nextRequests[nextRequests.length-1];
+  return !!request && lowerName(request.from) === actor && Number.isFinite(Number(request.time));
 }
 
 
@@ -260,6 +278,8 @@ async function keyOwnerAllowed(env, claims, key, value, method, oldValue = null)
   const v = rawUserFromValue(value);
 
   if (method === 'read') {
+    // Ad configuration must be readable by members so sponsored cards can render.
+    if (d.lower === 'ads:active') return true;
     if (d.lower.startsWith('user:')) return true; // response is sanitized for non-staff below
     if (d.lower.startsWith('uname:')) return true;
     if (d.lower.startsWith('friends:')) return true; // friend lists are social/public
@@ -290,6 +310,7 @@ async function keyOwnerAllowed(env, claims, key, value, method, oldValue = null)
   // administrative account changes, while moderators are restricted to the
   // moderation fields they actually need. No browser-controlled role flag is
   // trusted here.
+  if (d.lower === 'ads:active') return isAdmin(claims, env); // only owner/admin may publish, disable, or delete ads
   if (d.lower.startsWith('user:')) {
     if (isOwner(claims, env)) return true;
     if (isAdmin(claims, env)) {
@@ -299,6 +320,8 @@ async function keyOwnerAllowed(env, claims, key, value, method, oldValue = null)
       const protectedIdentity = ['isOwner','isSupportAgent','uid','email'];
       if (old && v) for (const k of protectedIdentity) { if (JSON.stringify(old[k]) !== JSON.stringify(v[k])) return false; }
       if (old && v) {
+        if (v.verified === true && old.verified !== true && old.pendingVerification !== true) return false;
+        if (v.verified === true && v.pendingVerification !== false) return false;
         const targetUid = String(old.uid || v.uid || '').trim();
         const authoritative = targetUid ? await env.CHATME_KV.get('role:' + targetUid) : null;
         const expectedAdmin = authoritative === 'admin';
@@ -310,7 +333,9 @@ async function keyOwnerAllowed(env, claims, key, value, method, oldValue = null)
     if (isModerator(claims, env)) {
       const old = rawUserFromValue(oldValue);
       if (!old || !v || old.isOwner === true || old.isAdmin === true || v.isOwner === true || v.isAdmin === true) return false;
-      const allowed = ['verified','banned','banReason','banUntil','status','statusUpdatedAt'];
+      const allowed = ['verified','banned','banReason','banUntil','status','statusUpdatedAt','pendingVerification','verifiedAt','verifiedBy'];
+      if (v.verified === true && old.verified !== true && old.pendingVerification !== true) return false;
+      if (v.verified === true && v.pendingVerification !== false) return false;
       const keys = new Set([...Object.keys(old), ...Object.keys(v)]);
       for (const k of keys) {
         if (allowed.includes(k)) continue;
@@ -318,7 +343,25 @@ async function keyOwnerAllowed(env, claims, key, value, method, oldValue = null)
       }
       return true;
     }
-    return d.userEmail === email && v && String(v.uid || '') === id.uid && String(v.email || '').toLowerCase() === email;
+    if (d.userEmail !== email || !v || String(v.uid || '') !== id.uid || String(v.email || '').toLowerCase() !== email) return false;
+    const old = rawUserFromValue(oldValue);
+    if (old) {
+      // These fields are controlled by trusted staff/backend, never by a member editing their own profile.
+      const protectedFlags = ['isOwner','isAdmin','isModerator','isSupportAgent','verified','banned','adminEmailVerified'];
+      for (const field of protectedFlags) if (Boolean(old[field]) !== Boolean(v[field])) return false;
+      for (const field of ['banReason','banUntil','bannedAt','bannedBy','verifiedAt','verifiedBy','pendingAdminCode','pendingAdminCodeAt']) {
+        if (!sameValue(old[field], v[field])) return false;
+      }
+      if (!sameValue(old.pendingVerification, v.pendingVerification)) {
+        const isNewRequest = v.pendingVerification === true && old.pendingVerification !== true && old.verified !== true;
+        const oldBalance = Number(old.leos || 0), newBalance = Number(v.leos || 0);
+        if (!isNewRequest || !Number.isFinite(oldBalance) || !Number.isFinite(newBalance) || Math.abs((oldBalance - newBalance) - 50000) > 0.001 || !Number.isFinite(Number(v.verificationRequestedAt))) return false;
+      }
+    } else {
+      // New profile creation cannot self-assign staff or verification flags.
+      if (v.isOwner || v.isAdmin || v.isModerator || v.isSupportAgent || v.verified || v.banned || v.adminEmailVerified) return false;
+    }
+    return true;
   }
   if (d.lower.startsWith('audit:')) return isModerator(claims, env);
   if (d.lower.startsWith('purchase:')) {
@@ -332,11 +375,14 @@ async function keyOwnerAllowed(env, claims, key, value, method, oldValue = null)
   }
   if (d.lower.startsWith('uname:')) return !!username && d.username === username && String(value || '').toLowerCase() === email;
   if (d.lower.startsWith('friends:')) return d.username === username || sameArrayExceptOwnChange(oldValue, value, username, 'change');
-  if (d.lower.startsWith('requests:') || d.lower.startsWith('sentreq:')) return d.username === username || sameArrayExceptOwnChange(oldValue, value, username, 'change');
+  if (d.lower.startsWith('requests:')) return d.username === username || validateIncomingRequestAppend(oldValue, value, username);
+  if (d.lower.startsWith('sentreq:')) return d.username === username || sameArrayExceptOwnChange(oldValue, value, username, 'change');
   if (d.lower.startsWith('notifs:')) {
     if (d.username === username) return true;
-    const old=rawUserFromValue(oldValue), next=rawUserFromValue(value);
-    if (!Array.isArray(old)||!Array.isArray(next)||next.length!==old.length+1) return false;
+    // A first notification has no stored key yet; treat that missing value as an empty list.
+    const parsedOld=oldValue==null?[]:rawUserFromValue(oldValue);
+    const old=Array.isArray(parsedOld)?parsedOld:null, next=rawUserFromValue(value);
+    if (!old||!Array.isArray(next)||next.length!==old.length+1) return false;
     for(let i=0;i<old.length;i++) if(!sameValue(old[i],next[i])) return false;
     const n=next[next.length-1];
     const allowedTypes=['message','reaction','comment','like','announcement','welcome','coins_topup','purchase_rejected','friend_request','mention','virtual_gift','purchase_request'];
@@ -494,6 +540,20 @@ async function cmExternalizeMedia(storageKey, value, env) {
   return JSON.stringify(obj);
 }
 
+async function writeAudit(env, claims, action, key, extra = {}) {
+  // Audit metadata only; never store tokens, passwords, full profile records, or message content.
+  try {
+    const uid = String(claims?.sub || 'unknown').slice(0, 128);
+    const role = String(claims?._chatmeRole || 'user').slice(0, 24);
+    const safeKey = String(key || '').slice(0, 180);
+    const record = { action:String(action).slice(0, 60), target:safeKey, actorUid:uid, actorRole:role, time:Date.now(), ...extra };
+    await env.CHATME_KV.put('audit:' + Date.now() + ':' + crypto.randomUUID(), JSON.stringify(record), { expirationTtl: 60 * 60 * 24 * 365 });
+  } catch (e) {
+    // Auditing must not turn a successful primary action into a failed request.
+    console.error('CHATME_AUDIT_WRITE_FAILED');
+  }
+}
+
 async function handleStorage(request, env, claims) {
   const url = new URL(request.url);
   const op = url.searchParams.get('op') || 'get';
@@ -544,6 +604,9 @@ async function handleStorage(request, env, claims) {
       const storedValue = (key.startsWith('post:') || key.startsWith('gpost:')) ? await cmExternalizeMedia(key, value, env) : value;
       if (storedValue.length > 2_000_000) return json({ ok:false, error:'value_too_large_after_media_chunking' }, 400);
       await env.CHATME_KV.put(key, storedValue);
+      if (isStaff(claims, env) && (key.startsWith('user:') || key.startsWith('post:') || key.startsWith('report:') || key.startsWith('supportticket:') || key === 'ads:active' || key.startsWith('role:'))) {
+        await writeAudit(env, claims, 'storage_set', key, { namespace });
+      }
       console.log('CHATME_STORAGE_WRITE_OK', JSON.stringify({ operation:'set', namespace }));
     } catch (writeError) {
       console.error('CHATME_KV_PUT_FAILED', JSON.stringify({ operation:'set', namespace, errorName:String(writeError?.name || 'Error') }));
@@ -566,6 +629,9 @@ async function handleStorage(request, env, claims) {
       await Promise.all(cleanup);
     }
     await env.CHATME_KV.delete(key);
+    if (isStaff(claims, env) && (key.startsWith('user:') || key.startsWith('post:') || key.startsWith('report:') || key.startsWith('supportticket:') || key === 'ads:active' || key.startsWith('role:'))) {
+      await writeAudit(env, claims, 'storage_delete', key, { namespace:String(key.split(':',1)[0] || 'unknown') });
+    }
     return json({ ok:true });
   }
   if (op === 'list') {
@@ -577,6 +643,8 @@ async function handleStorage(request, env, claims) {
     let listAllowed = isStaff(claims,env);
     let filterChatKeys = false;
     if (!listAllowed && pLower === 'post:') listAllowed = true;
+    // Public username keys support member discovery without exposing a list of emails.
+    if (!listAllowed && pLower === 'uname:') listAllowed = true;
     if (!listAllowed && (pLower === 'presence:' || pLower === 'group:' || pLower === 'room:')) listAllowed = true;
     if (!listAllowed && pLower === 'chat:') { listAllowed = true; filterChatKeys = true; }
     if (!listAllowed && pLower.startsWith('gpost:')) {
@@ -585,11 +653,53 @@ async function handleStorage(request, env, claims) {
     }
     if (!listAllowed && ['friends:','requests:','sentreq:','notifs:','presence:','seen:','typing:','savedposts:','storyviews:'].some(p=>pLower===p+id.username)) listAllowed=true;
     if (!listAllowed) return json({ ok:false, error:'forbidden' }, 403);
-    const result = await env.CHATME_KV.list({ prefix, limit: 1000 });
+    const cursor = url.searchParams.get('cursor') || undefined;
+    const result = await env.CHATME_KV.list({ prefix, limit: 1000, ...(cursor ? { cursor } : {}) });
     const keys = filterChatKeys ? result.keys.filter(x => decodeKey(x.name).chatUsers?.includes(id.username)) : result.keys;
     return json({ ok:true, keys: keys.map(x => x.name), cursor: result.list_complete ? null : result.cursor });
   }
   return json({ ok:false, error:'unknown_op' }, 400);
+}
+
+async function adminOverview(env, claims) {
+  if (!isStaff(claims, env)) return json({ ok:false, error:'forbidden' }, 403);
+  const countPrefix = async (prefix, maxPages = 50) => {
+    let cursor;
+    let count = 0;
+    let pages = 0;
+    do {
+      const page = await env.CHATME_KV.list({ prefix, limit: 1000, ...(cursor ? { cursor } : {}) });
+      count += page.keys.length;
+      cursor = page.list_complete ? undefined : page.cursor;
+      pages++;
+    } while (cursor && pages < maxPages);
+    return { count, complete: !cursor };
+  };
+  const [users, posts, reports, tickets, adsRaw, userKeys] = await Promise.all([
+    countPrefix('user:'), countPrefix('post:'), countPrefix('report:'), countPrefix('supportticket:'),
+    env.CHATME_KV.get('ads:active'), env.CHATME_KV.list({ prefix:'user:', limit:1000 })
+  ]);
+  let pendingVerification = 0;
+  let verifiedUsers = 0;
+  // Verification counts are sampled from stored profile records; totals are explicitly marked
+  // incomplete when KV pagination exceeds the configured safety cap.
+  let cursor = undefined;
+  let pages = 0;
+  do {
+    const page = pages === 0 ? userKeys : await env.CHATME_KV.list({ prefix:'user:', limit:1000, cursor });
+    for (const item of page.keys) {
+      const raw = await env.CHATME_KV.get(item.name);
+      if (!raw) continue;
+      const profile = rawUserFromValue(raw);
+      if (profile?.pendingVerification === true) pendingVerification++;
+      if (profile?.verified === true) verifiedUsers++;
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+    pages++;
+  } while (cursor && pages < 50);
+  let ads = null;
+  try { ads = adsRaw ? JSON.parse(adsRaw) : null; } catch { ads = null; }
+  return json({ ok:true, counts:{ users:users.count, posts:posts.count, reports:reports.count, supportTickets:tickets.count, pendingVerification, verifiedUsers }, complete:{ users:users.complete, posts:posts.complete, reports:reports.complete, supportTickets:tickets.complete, verificationScan:!cursor }, ads });
 }
 
 async function staffRole(request, env, claims) {
@@ -603,6 +713,7 @@ async function staffRole(request, env, claims) {
   if (current === 'admin' && role === 'admin') return json({ ok:false, error:'owner_only' }, 403);
   if (role === 'user') await env.CHATME_KV.delete('role:' + uid);
   else await env.CHATME_KV.put('role:' + uid, role);
+  await writeAudit(env, claims, 'staff_role_changed', 'role:' + uid, { assignedRole:role });
   return json({ ok:true, uid, role });
 }
 
@@ -652,7 +763,7 @@ export default {
     const url = new URL(request.url);
     if (request.method === 'OPTIONS') {
       const origin = request.headers.get('Origin') || '';
-      const allowed = (() => { try { const o = new URL(origin); return o.origin === 'https://chat-me183.github.io' || (o.protocol === 'http:' && (o.hostname === 'localhost' || o.hostname === '127.0.0.1')); } catch { return false; } })();
+      const allowed = (() => { try { const o = new URL(origin); return o.origin === 'https://chat-me183.github.io' || (o.protocol === 'https:' && o.hostname.endsWith('.pages.dev')) || (o.protocol === 'http:' && (o.hostname === 'localhost' || o.hostname === '127.0.0.1')); } catch { return false; } })();
       if (!allowed) return new Response('', { status: 403 });
       return new Response(null, { status: 204, headers: {
         'Access-Control-Allow-Origin': origin,
@@ -668,6 +779,7 @@ export default {
       const claims = await auth(request, env);
       await assertNotBanned(env, claims);
       if (url.pathname === '/role' && request.method === 'GET') return cors(request, await getRole(request, env, claims));
+      if (url.pathname === '/admin/overview' && request.method === 'GET') return cors(request, await adminOverview(env, claims));
       if (url.pathname === '/staff-role' && request.method === 'POST') return cors(request, await staffRole(request, env, claims));
       if (url.pathname === '/storage') return cors(request, await handleStorage(request, env, claims));
       if (url.pathname === '/migrate-legacy') return cors(request, await migrateLegacy(request, env, claims));
