@@ -451,7 +451,9 @@ async function handleStorage(request, env, claims) {
   const url = new URL(request.url);
   const op = url.searchParams.get('op') || 'get';
   const key = url.searchParams.get('key') || '';
-  if (!key || key.length > 500) return json({ ok:false, error:'invalid_key' }, 400);
+  // The Chat Me frontend sends the list prefix in the `key` parameter,
+  // while some direct health checks send it as `prefix`. Support both.
+  if (op !== 'list' && (!key || key.length > 500)) return json({ ok:false, error:'invalid_key' }, 400);
 
   if (op === 'get') {
     const value = await env.CHATME_KV.get(key);
@@ -462,6 +464,8 @@ async function handleStorage(request, env, claims) {
   if (op === 'set') {
     const body = await request.json().catch(() => null);
     const value = body?.value;
+    let parsedValue = null;
+    if (typeof value === 'string') { try { parsedValue = JSON.parse(value); } catch {} }
     if (typeof value !== 'string' || value.length > 2_000_000) return json({ ok:false, error:'invalid_value' }, 400);
     const oldValue = await env.CHATME_KV.get(key);
     const allowed = await keyOwnerAllowed(env, claims, key, value, 'write', oldValue);
@@ -477,8 +481,8 @@ async function handleStorage(request, env, claims) {
         identityUidPresent: !!identityInfo.uid,
         identityEmailPresent: !!identityInfo.email,
         identityUsernamePresent: !!identityInfo.username,
-        userUidMatchesToken: keyLower.startsWith('user:') ? String(v?.uid || '') === String(claims.user_id || claims.sub || '') : null,
-        userEmailMatchesToken: keyLower.startsWith('user:') ? String(v?.email || '').toLowerCase() === String(claims.email || '').toLowerCase() : null,
+        userUidMatchesToken: keyLower.startsWith('user:') ? String(parsedValue?.uid || '') === String(claims.user_id || claims.sub || '') : null,
+        userEmailMatchesToken: keyLower.startsWith('user:') ? String(parsedValue?.email || '').toLowerCase() === String(claims.email || '').toLowerCase() : null,
         userKeyMatchesTokenEmail: keyLower.startsWith('user:') ? key.slice(5).toLowerCase() === String(claims.email || '').toLowerCase() : null,
         usernameKeyMatchesIdentity: keyLower.startsWith('uname:') ? key.slice(6).toLowerCase() === identityInfo.username : null,
         usernameValueMatchesIdentityEmail: keyLower.startsWith('uname:') ? String(value || '').toLowerCase() === identityInfo.email : null
@@ -502,7 +506,7 @@ async function handleStorage(request, env, claims) {
     return json({ ok:true });
   }
   if (op === 'list') {
-    const prefix = url.searchParams.get('prefix') || '';
+    const prefix = url.searchParams.get('prefix') || key || '';
     if (prefix.length > 300) return json({ ok:false, error:'invalid_prefix' }, 400);
     // Only staff may list arbitrary namespaces. Regular users may list their own username-scoped namespaces.
     const id = await identity(env, claims);
