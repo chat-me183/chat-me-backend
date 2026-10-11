@@ -219,9 +219,9 @@ function validatePostMutation(oldValue,newValue,claims,method,isOwnerFlag=false,
     if(lowerName(next.author)!==actor) return false;
     if(typeof next.id!=='string' || next.id.length<3 || next.id.length>120) return false;
     if(typeof next.authorName!=='string' || next.authorName.length>200) return false;
-    if(typeof next.text!=='string' || next.text.length>20000) return false;
-    if(next.image && (typeof next.image!=='string' || next.image.length>1800000)) return false;
-    if(next.video && (typeof next.video!=='string' || next.video.length>1800000)) return false;
+    if(typeof next.text!=='string' || next.text.length>50000 || cmWordCount(next.text)>1000) return false;
+    if(next.image && (typeof next.image!=='string' || next.image.length>8_000_000)) return false;
+    if(next.video && (typeof next.video!=='string' || next.video.length>30_000_000)) return false;
     if(!Number.isFinite(Number(next.time))) return false;
     if(Number(next.time) < Date.now()-10*60*1000 || Number(next.time) > Date.now()+10*60*1000) return false;
     if(!Array.isArray(next.likes) || next.likes.length!==0) return false;
@@ -447,6 +447,53 @@ function publicSanitize(key, value, claims, env) {
   return JSON.stringify(safe);
 }
 
+const CM_MEDIA_CHUNK_CHARS = 1_200_000;
+function cmWordCount(text) { return String(text || '').trim().split(/\s+/u).filter(Boolean).length; }
+function cmMediaChunkKey(storageKey, kind, index) { return `cmmedia:${storageKey}:${kind}:${index}`; }
+function cmIsMediaRef(value) { return !!value && typeof value === 'object' && value.__chatMeMediaRef === true && Number.isInteger(value.chunks) && value.chunks > 0; }
+async function cmHydrateMediaValue(storageKey, value, env) {
+  if (!value || !(storageKey.startsWith('post:') || storageKey.startsWith('gpost:'))) return value;
+  let obj; try { obj = JSON.parse(value); } catch { return value; }
+  let changed = false;
+  for (const kind of ['image','video']) {
+    const ref = obj[kind];
+    if (!cmIsMediaRef(ref) || ref.storageKey !== storageKey || ref.kind !== kind || ref.chunks > 30) continue;
+    const parts = await Promise.all(Array.from({length:ref.chunks},(_,i)=>env.CHATME_KV.get(cmMediaChunkKey(storageKey,kind,i))));
+    if (parts.some(p=>p == null)) throw new Error('media_chunk_missing');
+    obj[kind] = parts.join('');
+    changed = true;
+  }
+  return changed ? JSON.stringify(obj) : value;
+}
+async function cmExternalizeMedia(storageKey, value, env) {
+  let obj; try { obj = JSON.parse(value); } catch { return value; }
+  const oldRaw = await env.CHATME_KV.get(storageKey);
+  let oldObj = null; try { oldObj = oldRaw ? JSON.parse(oldRaw) : null; } catch {}
+  const puts = [];
+  for (const kind of ['image','video']) {
+    const data = obj[kind];
+    if (typeof data !== 'string' || !data.startsWith('data:') || data.length <= CM_MEDIA_CHUNK_CHARS) continue;
+    const parts=[];
+    for(let i=0;i<data.length;i+=CM_MEDIA_CHUNK_CHARS) parts.push(data.slice(i,i+CM_MEDIA_CHUNK_CHARS));
+    if(parts.length>30) throw new Error('media_too_large');
+    parts.forEach((part,i)=>puts.push(env.CHATME_KV.put(cmMediaChunkKey(storageKey,kind,i),part)));
+    obj[kind]={__chatMeMediaRef:true,storageKey,kind,chunks:parts.length,length:data.length};
+    const oldRef=oldObj?.[kind];
+    if(cmIsMediaRef(oldRef) && oldRef.storageKey===storageKey && oldRef.kind===kind && oldRef.chunks>parts.length) {
+      for(let i=parts.length;i<oldRef.chunks;i++) puts.push(env.CHATME_KV.delete(cmMediaChunkKey(storageKey,kind,i)));
+    }
+  }
+  // Clean up old chunked media when the user removes an attachment.
+  for (const kind of ['image','video']) {
+    const oldRef=oldObj?.[kind];
+    if ((!obj[kind] || obj[kind]==='') && cmIsMediaRef(oldRef) && oldRef.storageKey===storageKey && oldRef.kind===kind) {
+      for(let i=0;i<oldRef.chunks;i++) puts.push(env.CHATME_KV.delete(cmMediaChunkKey(storageKey,kind,i)));
+    }
+  }
+  await Promise.all(puts);
+  return JSON.stringify(obj);
+}
+
 async function handleStorage(request, env, claims) {
   const url = new URL(request.url);
   const op = url.searchParams.get('op') || 'get';
@@ -456,9 +503,10 @@ async function handleStorage(request, env, claims) {
   if (op !== 'list' && (!key || key.length > 500)) return json({ ok:false, error:'invalid_key' }, 400);
 
   if (op === 'get') {
-    const value = await env.CHATME_KV.get(key);
+    let value = await env.CHATME_KV.get(key);
     if (value == null) return json({ ok:true, value:null });
     if (!await keyOwnerAllowed(env, claims, key, value, 'read')) return json({ ok:false, error:'forbidden' }, 403);
+    value = await cmHydrateMediaValue(key, value, env);
     return json({ ok:true, value:publicSanitize(key, value, claims, env) });
   }
   if (op === 'set') {
@@ -466,8 +514,10 @@ async function handleStorage(request, env, claims) {
     const value = body?.value;
     let parsedValue = null;
     if (typeof value === 'string') { try { parsedValue = JSON.parse(value); } catch {} }
-    if (typeof value !== 'string' || value.length > 2_000_000) return json({ ok:false, error:'invalid_value' }, 400);
-    const oldValue = await env.CHATME_KV.get(key);
+    if (typeof value !== 'string' || value.length > 32_000_000) return json({ ok:false, error:'invalid_value' }, 400);
+    let oldValue = await env.CHATME_KV.get(key);
+    if (oldValue != null) oldValue = await cmHydrateMediaValue(key, oldValue, env);
+    if ((key.startsWith('post:') || key.startsWith('gpost:')) && parsedValue && typeof parsedValue.text === 'string' && cmWordCount(parsedValue.text) > 1000) return json({ ok:false, error:'post_text_over_1000_words' }, 400);
     const allowed = await keyOwnerAllowed(env, claims, key, value, 'write', oldValue);
     const namespace = String(key.split(':', 1)[0] || 'unknown').slice(0, 30);
     if (!allowed) {
@@ -491,7 +541,9 @@ async function handleStorage(request, env, claims) {
       return json({ ok:false, error:'forbidden' }, 403);
     }
     try {
-      await env.CHATME_KV.put(key, value);
+      const storedValue = (key.startsWith('post:') || key.startsWith('gpost:')) ? await cmExternalizeMedia(key, value, env) : value;
+      if (storedValue.length > 2_000_000) return json({ ok:false, error:'value_too_large_after_media_chunking' }, 400);
+      await env.CHATME_KV.put(key, storedValue);
       console.log('CHATME_STORAGE_WRITE_OK', JSON.stringify({ operation:'set', namespace }));
     } catch (writeError) {
       console.error('CHATME_KV_PUT_FAILED', JSON.stringify({ operation:'set', namespace, errorName:String(writeError?.name || 'Error') }));
@@ -502,6 +554,17 @@ async function handleStorage(request, env, claims) {
   if (op === 'delete') {
     const old = await env.CHATME_KV.get(key);
     if (old != null && !await keyOwnerAllowed(env, claims, key, old, 'delete', old)) return json({ ok:false, error:'forbidden' }, 403);
+    if (old != null && (key.startsWith('post:') || key.startsWith('gpost:'))) {
+      let post; try { post = JSON.parse(old); } catch {}
+      const cleanup=[];
+      for (const kind of ['image','video']) {
+        const ref=post?.[kind];
+        if (cmIsMediaRef(ref) && ref.storageKey===key && ref.kind===kind) {
+          for(let i=0;i<ref.chunks;i++) cleanup.push(env.CHATME_KV.delete(cmMediaChunkKey(key,kind,i)));
+        }
+      }
+      await Promise.all(cleanup);
+    }
     await env.CHATME_KV.delete(key);
     return json({ ok:true });
   }
