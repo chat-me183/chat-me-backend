@@ -715,16 +715,22 @@ async function acceptFriendRequest(request, env, claims) {
     cmReadArray(env, reqKey), cmReadArray(env, 'friends:' + me), cmReadArray(env, 'friends:' + from),
     cmReadArray(env, sentKey), cmReadArray(env, myNotifKey), cmReadArray(env, theirNotifKey)
   ]);
-  const hasPending = cmHasName(myRequests, from, 'from') || myNotifs.some(n => n?.type === 'friend_request' && lowerName(n?.from) === from && !n?.handled);
+  // Treat either side's pending-request index as evidence. Older client versions
+  // may have saved sentreq but failed to save requests/notifs; accepting should
+  // still reconcile both accounts instead of leaving a stuck request.
+  const hasPending = cmHasName(myRequests, from, 'from')
+    || myNotifs.some(n => n?.type === 'friend_request' && lowerName(n?.from) === from && !n?.handled)
+    || cmHasName(theirSent, me);
   if (!hasPending && !(cmHasName(myFriends, from) && cmHasName(theirFriends, me))) return json({ ok:false, error:'request_not_found' }, 404);
   if (!cmHasName(myFriends, from)) myFriends.push(from);
   if (!cmHasName(theirFriends, me)) theirFriends.push(me);
   const nextRequests = myRequests.filter(r => lowerName(r?.from) !== from);
   const nextSent = theirSent.filter(u => lowerName(u) !== me);
   const nextMyNotifs = myNotifs.map(n => n?.type === 'friend_request' && lowerName(n?.from) === from ? { ...n, handled:true, read:true, acceptedAt:Date.now() } : n);
-  if (!theirNotifs.some(n => n?.type === 'friend_accept' && lowerName(n?.from) === me && Number(n?.time) > Date.now() - 60000)) {
-    const receiverRaw = await env.CHATME_KV.get('user:' + actor.email);
-    const receiverProfile = receiverRaw ? rawUserFromValue(receiverRaw) : null;
+  const receiverRaw = await env.CHATME_KV.get('user:' + actor.email);
+  const receiverProfile = receiverRaw ? rawUserFromValue(receiverRaw) : null;
+  const recentAccept = theirNotifs.some(n => n?.type === 'friend_accept' && lowerName(n?.from) === me && Number(n?.time) > Date.now() - 60000);
+  if (!recentAccept) {
     theirNotifs.push({ id:Date.now() + '-' + Math.random().toString(36).slice(2,8), type:'friend_accept', from:me, fromName:((receiverProfile?.firstName || '') + ' ' + (receiverProfile?.lastName || '')).trim() || me, time:Date.now(), read:false, handled:true });
   }
   await Promise.all([
